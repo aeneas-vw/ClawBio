@@ -155,6 +155,20 @@ python skills/bj-expression-wrapper/bj_expression_wrapper.py --demo --output ~/s
 
 Optional overrides (each omitted flag keeps the pipeline default): `--n-reads`, `--read-length`, `--min-reads`, `--seed` (the pipeline's seqtk seed), `--skip-subsampling`, `--skip-cutadapt`, `--skip-qc-plots`, `--instrument`, `--genomes-base`.
 
+Wrapper options: `--nextflow-version` (default `25.04.6`, set as `NXF_VER` on every Nextflow call; `system` leaves your install alone) and `--extra-config FILE` (passed to Nextflow with `-c` and copied into the bundle).
+
+## Hosts without Docker (for example a gVisor container)
+
+Apptainer cannot mount `.sif` images there, so Nextflow's normal pull fails. A sandbox *directory* run with `--writable` works, and Nextflow uses one found in `singularity.cacheDir` under the name it would have given the pulled image. `apptainer_sandboxes.py` builds all 17 images the RNA-seq path needs and writes the config:
+
+```bash
+python skills/bj-expression-wrapper/apptainer_sandboxes.py \
+  --cache-dir ~/bj-expression-sandboxes --config-out ~/bj-expression-sandboxes/sandbox.config
+# then add to the run:  --profile singularity --extra-config ~/bj-expression-sandboxes/sandbox.config
+```
+
+Only your home directory is bound into the containers by default. Keep FASTQs and the output under it, or pass `--bind` for another path.
+
 ## Demo
 
 ```bash
@@ -211,7 +225,7 @@ output_directory/
 ## Dependencies
 
 **Required**:
-- Java and `nextflow` (on PATH)
+- Java 17 and `nextflow` (on PATH; the wrapper pins the release it runs)
 - Docker (default) or Apptainer/Singularity (`--profile singularity`)
 - `git`
 - A checkout of `BioSkryb/bj-expression` at the pinned tag (you supply it)
@@ -221,6 +235,8 @@ Docker needs a Carolina Cloud VM; containers cannot run it. The README suggests 
 ## Gotchas
 
 - **The model will want to read defaults from the README. Do not.** It says `--reads_csv` where the code takes `--input_csv`, calls subsampling skipped by default when the config does not, and gives a different read length than the config. Use the pinned `nextflow.config`.
+- **The model will want to use the newest Nextflow. Do not.** Nextflow 26.x cannot parse this pipeline's config (it includes two profile files that are not in the public repo). 25.04.6 and 24.10.5 parse it (config parse only; a full run on 24.10.5 was not tried). The wrapper pins 25.04.6.
+- **The model will want to say the sandbox workaround is proven. It is not.** It was tested end to end with Nextflow 25.04.6 and one real image (seqtk 1.3) only. Whether other images, or many tasks sharing one writable sandbox, behave the same is untested.
 - **The model will want to clone or vendor the pipeline for the user. Do not.** It is under BioSkryb's terms, not an open-source licence. The user fetches it and passes `--pipeline-dir`; the wrapper never downloads it.
 - **The model will want to say every input sample was analysed. Do not.** Samples below `min_reads` are dropped before quantification and simply absent from the counts. Read `samples_missing_from_outputs` in `result.json`.
 - **The model will want to treat Nextflow exit 0 as success. Do not.** The wrapper also requires the key outputs; otherwise the status is `incomplete`.

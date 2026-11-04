@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shlex
 import shutil
@@ -40,6 +41,10 @@ DEMO_CSV = SKILL_DIR / "examples" / "demo_samplesheet.csv"
 PROG = "bj-expression-wrapper"
 PIPELINE_REPO = "https://github.com/BioSkryb/bj-expression.git"
 DEFAULT_PIPELINE_VERSION = "2.0.0"
+# Nextflow 26.x cannot parse bj-expression 2.0.0's config: it includes two
+# profile files (batch_dev_gpu.config, batch_prod_gpu.config) that are not in
+# the public repo. 25.04.6 and 24.10.5 both parse it (config parse only).
+DEFAULT_NEXTFLOW_VERSION = "25.04.6"
 LICENSE_URL = "https://www.bioskryb.com/basejumper/local-license/"
 # Fixed so the published directory is predictable: <publish_dir>_<timestamp>.
 RUN_TIMESTAMP = "clawbio"
@@ -213,16 +218,26 @@ def check_pipeline_source(pipeline_dir: Path | None, version: str,
             "commit": commit, "dirty": dirty, "license_url": LICENSE_URL}
 
 
-def _version_line(cmd: list[str], pattern: str) -> str:
+def nextflow_env(nxf_version: str) -> dict:
+    """Environment for every nextflow call: pin NXF_VER unless told 'system'."""
+    env = dict(os.environ)
+    if nxf_version != "system":
+        env["NXF_VER"] = nxf_version
+    return env
+
+
+def _version_line(cmd: list[str], pattern: str, env: dict | None = None) -> str:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        # the first call with a pinned NXF_VER downloads that Nextflow release
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                              env=env)
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
     m = re.search(pattern, proc.stdout + proc.stderr)
     return m.group(1) if m else "unknown"
 
 
-def preflight_tools(profile: str) -> dict:
+def preflight_tools(profile: str, nxf_version: str = DEFAULT_NEXTFLOW_VERSION) -> dict:
     """Check Java, Nextflow and the container backend; report every problem."""
     problems, tools = [], {}
     if shutil.which("java"):
@@ -233,7 +248,8 @@ def preflight_tools(profile: str) -> dict:
             "(for example: conda install -c conda-forge openjdk).")
     if shutil.which("nextflow"):
         tools["nextflow"] = _version_line(["nextflow", "-version"],
-                                          r"version\s+(\S+)")
+                                          r"version\s+(\S+)",
+                                          env=nextflow_env(nxf_version))
     else:
         problems.append("nextflow not found on PATH. Install it from "
                         "https://www.nextflow.io/docs/latest/install.html")
@@ -292,10 +308,13 @@ def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path) -> dic
 
 
 def build_command(pipeline_dir: str, params_file: Path, work_dir: Path,
-                  profile: str, resume: bool) -> list[str]:
+                  profile: str, resume: bool,
+                  extra_config: Path | None = None) -> list[str]:
     cmd = ["nextflow", "run", str(Path(pipeline_dir) / "main.nf"),
            "-params-file", str(params_file), "-work-dir", str(work_dir),
            "-ansi-log", "false"]
+    if extra_config is not None:
+        cmd += ["-c", str(extra_config)]
     if profile != "docker":  # docker is enabled by the pipeline's own config
         cmd += ["-profile", profile]
     if resume:
@@ -307,12 +326,13 @@ def build_command(pipeline_dir: str, params_file: Path, work_dir: Path,
 # Execution and outputs
 # ──────────────────────────────────────────────
 
-def run_nextflow(cmd: list[str], run_dir: Path) -> tuple[int, str]:
+def run_nextflow(cmd: list[str], run_dir: Path,
+                 env: dict | None = None) -> tuple[int, str]:
     """Run in run_dir (Nextflow litters its cwd); logs go to files, tail returned."""
     run_dir.mkdir(parents=True, exist_ok=True)
     out_log, err_log = run_dir / "nextflow.stdout.log", run_dir / "nextflow.stderr.log"
     with open(out_log, "w") as so, open(err_log, "w") as se:
-        proc = subprocess.run(cmd, cwd=run_dir, stdout=so, stderr=se)
+        proc = subprocess.run(cmd, cwd=run_dir, stdout=so, stderr=se, env=env)
     tail = "\n".join(err_log.read_text(errors="replace").splitlines()[-40:])
     return proc.returncode, tail
 
@@ -399,7 +419,8 @@ def write_report(out_dir: Path, result: dict) -> Path:
     return path
 
 
-def write_bundle(out_dir: Path, command: str | None) -> None:
+def write_bundle(out_dir: Path, command: str | None,
+                 extra_config: Path | None = None) -> None:
     write_commands_sh(out_dir, command or "# plan only: no command was run")
     write_environment_yml(
         out_dir, "clawbio-bj-expression-wrapper", pip_deps=[],
@@ -408,7 +429,8 @@ def write_bundle(out_dir: Path, command: str | None) -> None:
     repro = out_dir / "reproducibility"
     write_checksums(
         [out_dir / "report.md", out_dir / "result.json", repro / "commands.sh",
-         repro / "params.json", repro / "samplesheet.normalised.csv"],
+         repro / "params.json", repro / "samplesheet.normalised.csv",
+         *([extra_config] if extra_config else [])],
         out_dir, anchor=out_dir)
 
 
@@ -426,6 +448,14 @@ def _int(minimum: int, what: str):
             raise argparse.ArgumentTypeError(f"{what} must be >= {minimum}")
         return n
     return conv
+
+
+def _nxf_version(value: str) -> str:
+    if value == "system" or re.fullmatch(r"\d+\.\d+\.\d+", value):
+        return value
+    raise argparse.ArgumentTypeError(
+        "--nextflow-version must look like 25.04.6 (or 'system' to use the "
+        "installed Nextflow unchanged)")
 
 
 def _memory(value: str) -> str:
@@ -473,6 +503,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-memory", type=_memory)
     p.add_argument("--genomes-base", help="Mirror of the reference bundle (default: BioSkryb's public S3)")
     p.add_argument("--resume", action="store_true", help="Pass -resume to Nextflow")
+    p.add_argument("--nextflow-version", type=_nxf_version,
+                   default=DEFAULT_NEXTFLOW_VERSION,
+                   help=f"Nextflow release to run (default {DEFAULT_NEXTFLOW_VERSION}; "
+                        "'system' = whatever is installed). Newer 26.x releases "
+                        "cannot parse this pipeline's config.")
+    p.add_argument("--extra-config", type=Path,
+                   help="Extra Nextflow config passed with -c (for example container "
+                        "settings for hosts without Docker); copied into the bundle")
     return p
 
 
@@ -495,7 +533,8 @@ def run(args: argparse.Namespace) -> int:
     if mode == "check" and args.input is None:
         raise WrapperError("--input is required with --check")
 
-    out_dir: Path = args.output
+    # Nextflow runs from <output>/nextflow_run, so every path must be absolute.
+    out_dir: Path = args.output.expanduser().resolve()
     if (out_dir / "result.json").exists() and not (mode == "run" and args.resume):
         raise WrapperError(
             f"{out_dir} already holds results; choose a new --output "
@@ -513,19 +552,28 @@ def run(args: argparse.Namespace) -> int:
     if mode != "demo":
         pipeline = check_pipeline_source(args.pipeline_dir, args.pipeline_version,
                                          args.allow_dirty_pipeline)
-        tools = preflight_tools(args.profile)
+        tools = preflight_tools(args.profile, args.nextflow_version)
+
+    if args.extra_config is not None and not args.extra_config.is_file():
+        raise WrapperError(f"--extra-config file not found: {args.extra_config}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     repro = out_dir / "reproducibility"
     repro.mkdir(exist_ok=True)
+    kept_config = None
+    if args.extra_config is not None:
+        kept_config = repro / "extra.config"
+        shutil.copyfile(args.extra_config, kept_config)
     csv_path = write_normalised_csv(rows, repro / "samplesheet.normalised.csv")
     params = build_params(args, csv_path, out_dir)
     (repro / "params.json").write_text(json.dumps(params, indent=2) + "\n")
 
     run_dir = out_dir / "nextflow_run"
     cmd = build_command(pipeline["path"] if pipeline else "<path-to-bj-expression-checkout>",
-                        repro / "params.json", out_dir / "work", args.profile, args.resume)
-    command_text = f"cd {shlex.quote(str(run_dir))} && {shlex.join(cmd)}"
+                        repro / "params.json", out_dir / "work", args.profile, args.resume,
+                        kept_config)
+    pin = "" if args.nextflow_version == "system" else f"NXF_VER={args.nextflow_version} "
+    command_text = f"cd {shlex.quote(str(run_dir))} && {pin}{shlex.join(cmd)}"
 
     result = {
         "skill": PROG,
@@ -535,6 +583,8 @@ def run(args: argparse.Namespace) -> int:
         "pipeline": pipeline,
         "tools": tools,
         "profile": args.profile,
+        "nextflow_version_requested": args.nextflow_version,
+        "extra_config": str(kept_config) if kept_config else None,
         "params": params,
         "samples": samples,
         "command": command_text,
@@ -542,7 +592,7 @@ def run(args: argparse.Namespace) -> int:
     }
     exit_code = 0
     if mode == "run":
-        code, tail = run_nextflow(cmd, run_dir)
+        code, tail = run_nextflow(cmd, run_dir, nextflow_env(args.nextflow_version))
         result["nextflow_exit_code"] = code
         result["stderr_tail"] = tail
         found = collect_outputs(Path(params["publish_dir"] + "_" + RUN_TIMESTAMP), samples)
@@ -556,7 +606,7 @@ def run(args: argparse.Namespace) -> int:
 
     (out_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     write_report(out_dir, result)
-    write_bundle(out_dir, None if mode == "demo" else command_text)
+    write_bundle(out_dir, None if mode == "demo" else command_text, kept_config)
 
     if result["status"] == "failed":
         print(f"{PROG}: error: Nextflow exited {result['nextflow_exit_code']}\n"

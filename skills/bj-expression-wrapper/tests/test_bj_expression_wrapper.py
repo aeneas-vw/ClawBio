@@ -45,6 +45,10 @@ log = os.environ.get("FAKE_NF_LOG")
 if log:
     with open(log, "a") as fh:
         fh.write(json.dumps(args) + "\\n")
+envlog = os.environ.get("FAKE_NF_ENVLOG")
+if envlog:
+    with open(envlog, "a") as fh:
+        fh.write(os.environ.get("NXF_VER", "<unset>") + "\\n")
 if args[:1] == ["-version"]:
     print("nextflow version 25.04.0 build 5000")
     sys.exit(0)
@@ -583,3 +587,97 @@ class TestOutputContract:
         run_cli(["--demo", "--output", tmp_path], env={"PATH": str(tmp_path / "x")})
         missing = [p for p in promised if not (tmp_path / p).exists()]
         assert not missing, f"promised but not produced: {missing}"
+
+
+# ──────────────────────────────────────────────
+# Nextflow version pin and extra config
+# ──────────────────────────────────────────────
+# Nextflow 26.x cannot parse bj-expression 2.0.0's config (it includes profile
+# files that are not in the public repo); 25.04.6 and 24.10.5 can. So the
+# wrapper pins NXF_VER for every nextflow call it makes.
+
+def _env_lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_nextflow_version_is_pinned_by_default_for_every_call(setup):
+    envlog = setup["tmp"] / "env.log"
+    env = {**setup["env"], "FAKE_NF_ENVLOG": str(envlog)}
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=env)
+    seen = _env_lines(envlog)
+    assert len(seen) >= 2, "expected the preflight -version call and the run"
+    assert set(seen) == {"25.04.6"}
+    r = result_json(setup["out"])
+    assert r["nextflow_version_requested"] == "25.04.6"
+    cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
+    assert "NXF_VER=25.04.6" in cmd
+
+
+def test_nextflow_version_can_be_changed(setup):
+    envlog = setup["tmp"] / "env.log"
+    env = {**setup["env"], "FAKE_NF_ENVLOG": str(envlog)}
+    run_cli(base_args(setup, "--accept-bioskryb-terms",
+                      "--nextflow-version", "24.10.5"), env=env)
+    assert set(_env_lines(envlog)) == {"24.10.5"}
+
+
+def test_nextflow_version_system_leaves_the_installed_one_alone(setup):
+    envlog = setup["tmp"] / "env.log"
+    env = {**setup["env"], "FAKE_NF_ENVLOG": str(envlog)}
+    run_cli(base_args(setup, "--accept-bioskryb-terms",
+                      "--nextflow-version", "system"), env=env)
+    assert set(_env_lines(envlog)) == {"<unset>"}
+    cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
+    assert "NXF_VER" not in cmd
+
+
+@pytest.mark.parametrize("bad", ["abc", "25.04", "25.04.6; rm -rf /", "", "v25.04.6"])
+def test_invalid_nextflow_version_is_rejected(setup, bad):
+    res = run_cli(base_args(setup, "--accept-bioskryb-terms",
+                            "--nextflow-version", bad), env=setup["env"], expect=None)
+    assert res.returncode in (1, 2) and "error:" in res.stderr
+    # the wrapper's own message, not argparse's "unrecognized arguments"
+    assert "must look like 25.04.6" in res.stderr
+    assert not (setup["out"] / "result.json").exists()
+
+
+def test_extra_config_is_passed_with_dash_c_and_kept_in_the_bundle(setup):
+    cfg = setup["tmp"] / "site.config"
+    cfg.write_text("singularity { autoMounts = false }\n")
+    run_cli(base_args(setup, "--accept-bioskryb-terms",
+                      "--extra-config", cfg), env=setup["env"])
+    repro = setup["out"] / "reproducibility"
+    kept = repro / "extra.config"
+    assert kept.read_text() == cfg.read_text()
+    cmd = (repro / "commands.sh").read_text()
+    assert f"-c {kept}" in cmd
+    assert result_json(setup["out"])["extra_config"] == str(kept)
+    checksums = (repro / "checksums.sha256").read_text()
+    assert "reproducibility/extra.config" in checksums
+
+
+def test_missing_extra_config_is_named(setup):
+    res = run_cli(base_args(setup, "--accept-bioskryb-terms",
+                            "--extra-config", setup["tmp"] / "nope.config"),
+                  env=setup["env"], expect=None)
+    assert res.returncode != 0
+    assert "nope.config" in res.stderr and "not found" in res.stderr.lower()
+    assert "unrecognized" not in res.stderr
+
+
+def test_no_extra_config_means_no_dash_c(setup):
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
+    cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
+    assert " -c " not in cmd
+    assert result_json(setup["out"])["extra_config"] is None
+
+
+def test_relative_output_dir_works_because_nextflow_runs_elsewhere(setup):
+    """Nextflow runs in <output>/nextflow_run, so every path handed to it must
+    be absolute or a relative --output would lose its own params file."""
+    res = run_cli(["--input", setup["csv"], "--output", "rel_out",
+                   "--pipeline-dir", setup["pipeline"], "--accept-bioskryb-terms"],
+                  env=setup["env"], cwd=setup["tmp"])
+    r = json.loads((setup["tmp"] / "rel_out" / "result.json").read_text())
+    assert r["status"] == "success", res.stderr
+    assert Path(r["outputs"]["results_dir"]).is_absolute()

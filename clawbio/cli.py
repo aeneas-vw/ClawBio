@@ -762,9 +762,10 @@ SKILLS = {
         "demo_args": ["--demo"],
         "description": "Run BioSkryb BJ-Expression (RNA-seq from demultiplexed FASTQ pairs: Salmon, STAR/HTSeq, MultiQC) via Nextflow, with preflight checks and a pinned tag",
         "default_timeout_seconds": 60 * 60 * 12 + 10 * 60,
-        "extra_path_flags": {"--pipeline-dir"},
+        "extra_path_flags": {"--pipeline-dir", "--extra-config"},
         "allowed_extra_flags": {
             "--check", "--pipeline-dir", "--pipeline-version",
+            "--nextflow-version", "--extra-config",
             "--accept-bioskryb-terms", "--allow-dirty-pipeline",
             "--genome", "--profile", "--n-reads", "--read-length", "--min-reads",
             "--seed", "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots",
