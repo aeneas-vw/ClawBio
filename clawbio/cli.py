@@ -757,6 +757,26 @@ SKILLS = {
         },
         "accepts_genotypes": False,
     },
+    "bj-expression": {
+        "script": SKILLS_DIR / "bj-expression-wrapper" / "bj_expression_wrapper.py",
+        "demo_args": ["--demo"],
+        "description": "Run BioSkryb BJ-Expression (RNA-seq from demultiplexed FASTQ pairs: Salmon, STAR/HTSeq, MultiQC) via Nextflow, with preflight checks and a pinned tag",
+        "default_timeout_seconds": 60 * 60 * 12 + 10 * 60,
+        "extra_path_flags": {"--pipeline-dir"},
+        "allowed_extra_flags": {
+            "--check", "--pipeline-dir", "--pipeline-version",
+            "--accept-bioskryb-terms", "--allow-dirty-pipeline",
+            "--genome", "--profile", "--n-reads", "--read-length", "--min-reads",
+            "--seed", "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots",
+            "--instrument", "--max-cpus", "--max-memory", "--genomes-base",
+            "--resume",
+        },
+        "allowed_extra_flags_without_values": {
+            "--check", "--accept-bioskryb-terms", "--allow-dirty-pipeline",
+            "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots", "--resume",
+        },
+        "accepts_genotypes": False,
+    },
     "rnaseq-pipeline": {
         "script": SKILLS_DIR / "nfcore-rnaseq-wrapper" / "nfcore_rnaseq_wrapper.py",
         "demo_args": ["--demo"],
