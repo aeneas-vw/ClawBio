@@ -132,6 +132,28 @@ git clone --branch 2.0.0 --depth 1 https://github.com/BioSkryb/bj-expression.git
 
 BioSkryb's terms (https://www.bioskryb.com/basejumper/local-license/) limit use to internal research and bar giving third parties access to the service. Read them before running.
 
+## Building the human reference files yourself
+
+BioSkryb's reference bundle (`s3://bioskryb-public-data`) is not readable anonymously, so `bj_reference_builder.py` builds the GRCh38 files from public sources and writes them in the layout `--genomes-base` expects:
+
+```bash
+mkdir ~/bj-refs-downloads && bash skills/bj-expression-wrapper/download_references.sh ~/bj-refs-downloads
+python skills/bj-expression-wrapper/bj_reference_builder.py prepare \
+  --downloads ~/bj-refs-downloads --out ~/bj-expression-refs/refs
+```
+
+What it writes, and why each format is what it is (all read from the pipeline's own scripts):
+
+| Pipeline input | Built as | Format requirement |
+|---|---|---|
+| `gtf_file` | Ensembl 104 GTF, contigs renamed `1` to `chr1`, `MT` to `chrM` | Must match the genome FASTA's `chr` names or HTSeq counts nothing; only primary chromosomes are kept |
+| `tx2gene` | From that GTF | 5 columns, no header: transcript ID, transcript biotype, gene ID, gene biotype, gene symbol. Transcript IDs must equal the Salmon FASTA IDs exactly (both carry `.version`) |
+| `bed_files_dir` | One `<biotype>_transcripts.bed` per transcript biotype | Read only by the insert-size step; the file-name prefix is the biotype label |
+| Salmon input | Ensembl 104 cDNA + ncRNA, filtered to transcripts present in tx2gene, plus the genome as decoys | Every Salmon transcript must be in tx2gene |
+| `star_index`, Salmon index | Built from the files above (commands: `star_index_command`, `salmon_index_command`) | STAR must be 2.7.6a, the pipeline's version; needs a lot of RAM |
+| `genebody_ref` | 12-column BED of housekeeping-gene transcripts | Needs your gene list; not built by `prepare` |
+| cell-typing RDS | Not built here | See Gotchas |
+
 ## CLI Reference
 
 ```bash
@@ -237,6 +259,8 @@ Docker needs a Carolina Cloud VM; containers cannot run it. The README suggests 
 - **The model will want to read defaults from the README. Do not.** It says `--reads_csv` where the code takes `--input_csv`, calls subsampling skipped by default when the config does not, and gives a different read length than the config. Use the pinned `nextflow.config`.
 - **The model will want to use the newest Nextflow. Do not.** Nextflow 26.x cannot parse this pipeline's config (it includes two profile files that are not in the public repo). 25.04.6 and 24.10.5 parse it (config parse only; a full run on 24.10.5 was not tried). The wrapper pins 25.04.6.
 - **The model will want to say the sandbox workaround is proven. It is not.** It was tested end to end with Nextflow 25.04.6 and one real image (seqtk 1.3) only. Whether other images, or many tasks sharing one writable sandbox, behave the same is untested.
+- **The model will want to treat a SingleR RDS as a drop-in `db_celltype_qbio.RDS`. It is not.** The pipeline's cell-typing script reads a named list with `HPCA_singleR` (labels `label.main2`) and four BioSkryb-built references `GTEx_singleR`, `GTExmeds_singleR`, `TCGA_STN_singleR`, `TCGA_PT_singleR` (labels `Treatment`). Other lists fail that step, and the pipeline then retries twice and ignores the failure.
+- **The pipeline ignores failed tasks after two retries.** A run can exit 0 with steps missing. Do not report a clean run from the exit code alone.
 - **The model will want to clone or vendor the pipeline for the user. Do not.** It is under BioSkryb's terms, not an open-source licence. The user fetches it and passes `--pipeline-dir`; the wrapper never downloads it.
 - **The model will want to say every input sample was analysed. Do not.** Samples below `min_reads` are dropped before quantification and simply absent from the counts. Read `samples_missing_from_outputs` in `result.json`.
 - **The model will want to treat Nextflow exit 0 as success. Do not.** The wrapper also requires the key outputs; otherwise the status is `incomplete`.

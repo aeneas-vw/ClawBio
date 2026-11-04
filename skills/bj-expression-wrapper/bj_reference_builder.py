@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Build the human (GRCh38) reference files BJ-Expression 2.0.0 expects, from
+public sources, so a run does not depend on BioSkryb's S3 bucket.
+
+Inputs (all public): the NCBI GRCh38 no-alt analysis-set genome, the Ensembl 104
+GTF, and the Ensembl 104 cDNA and ncRNA FASTAs.
+
+Formats were read from the pipeline's own scripts, not guessed:
+  gtf_file      contigs must match the BAMs, so they are renamed chr-style
+  tx2gene       5 columns, no header, whitespace separated:
+                transcript_id, transcript_biotype, gene_id, gene_biotype, gene_symbol
+                (transcript_id must equal the Salmon FASTA ID exactly)
+  genebody_ref  12-column BED (geneBodyCoverageIsai.py skips anything else)
+  bed_files_dir <biotype>_transcripts.bed files (insert-size step, GRCh38 only)
+
+The result mirrors the layout of `genomes_base`, so pass the output root as
+`--genomes-base`. STAR and Salmon indexes are built separately (they need a lot
+of RAM) with the commands this module produces.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import re
+import shutil
+import sys
+from collections import Counter
+from pathlib import Path
+
+PRIMARY = (*map(str, range(1, 23)), "X", "Y", "MT")
+ATTR = re.compile(r'(\w+) "([^"]*)"')
+SAFE_BIOTYPE = re.compile(r"[A-Za-z0-9_]+")
+
+# Layout under genomes_base, as in BioSkryb's genomes.config for GRCh38.
+SEQ = Path("genomes/Homo_sapiens/NCBI/GRCh38/Sequence")
+STAR_DIR = SEQ / "star_chr_eqnames_wgs"
+SALMON_DIR = SEQ / "salmon_chr_eqnames_wgs"
+GTF_NAME = "Homo_sapiens.GRCh38.104.chr.gtf"
+TX2GENE_PATH = SEQ / "salmon" / "Ensemble_GRCh38_cDNA-ncRNA.complete.tx2gene"
+GENOME_MD5_NAME = "GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
+
+
+class BuilderError(Exception):
+    """A user-facing failure."""
+
+
+# ──────────────────────────────────────────────
+# GTF
+# ──────────────────────────────────────────────
+
+def ucsc_name(contig: str) -> str | None:
+    """Ensembl primary contig -> UCSC/NCBI-style name; None if not primary."""
+    if contig == "MT":
+        return "chrM"
+    return f"chr{contig}" if contig in PRIMARY else None
+
+
+def parse_attributes(field: str) -> dict[str, str]:
+    return dict(ATTR.findall(field))
+
+
+def _open_text(path: Path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
+
+
+def rename_gtf(lines, fasta_contigs: set[str] | None = None):
+    """Rename contigs chr-style; drop non-primary contigs and (optionally)
+    contigs absent from the genome FASTA. Returns (lines, stats)."""
+    out: list[str] = []
+    dropped: Counter = Counter()
+    not_in_fasta: Counter = Counter()
+    kept = 0
+    for raw in lines:
+        ln = raw.rstrip("\n")
+        if ln.startswith("#"):
+            out.append(ln)
+            continue
+        fields = ln.split("\t")
+        new = ucsc_name(fields[0])
+        if new is None:
+            dropped[fields[0]] += 1
+            continue
+        if fasta_contigs is not None and new not in fasta_contigs:
+            not_in_fasta[new] += 1
+            continue
+        fields[0] = new
+        out.append("\t".join(fields))
+        kept += 1
+    return out, {"kept": kept, "dropped_by_contig": dict(dropped),
+                 "not_in_fasta": dict(not_in_fasta)}
+
+
+def transcripts(gtf_lines, with_versions: bool = True) -> list[dict]:
+    """One record per transcript that has exons, in a canonical order."""
+    tx: dict[str, dict] = {}
+    exons: dict[str, list] = {}
+    for raw in gtf_lines:
+        if raw.startswith("#"):
+            continue
+        f = raw.rstrip("\n").split("\t")
+        if len(f) < 9:
+            continue
+        feature = f[2]
+        if feature not in ("transcript", "exon"):
+            continue
+        a = parse_attributes(f[8])
+        key = a.get("transcript_id")
+        if not key:
+            continue
+        if feature == "exon":
+            exons.setdefault(key, []).append((int(f[3]), int(f[4])))
+            continue
+        tver, gver = a.get("transcript_version"), a.get("gene_version")
+        gene = a.get("gene_id", "")
+        gene_full = f"{gene}.{gver}" if with_versions and gver else gene
+        tx[key] = {
+            "chrom": f[0], "strand": f[6],
+            "tx_id": f"{key}.{tver}" if with_versions and tver else key,
+            "gene_id": gene_full,
+            "symbol": a.get("gene_name") or gene_full,
+            "gene_biotype": a.get("gene_biotype") or "unknown",
+            "tx_biotype": a.get("transcript_biotype") or "unknown",
+        }
+    records = []
+    for key, rec in tx.items():
+        ex = sorted(exons.get(key, []))
+        if not ex:
+            continue
+        records.append({**rec, "exons": ex, "start": ex[0][0], "end": ex[-1][1]})
+    return sorted(records, key=lambda r: (r["chrom"], r["start"], r["end"], r["tx_id"]))
+
+
+def _clean(value: str) -> str:
+    """read.table splits on whitespace and treats # and quotes specially."""
+    return re.sub(r"[\s#\"']+", "_", value) or "NA"
+
+
+def tx2gene_lines(records: list[dict]) -> list[str]:
+    rows = sorted({(r["tx_id"], r["tx_biotype"], r["gene_id"], r["gene_biotype"], r["symbol"])
+                   for r in records})
+    return ["\t".join(_clean(c) for c in row) for row in rows]
+
+
+def bed12(rec: dict) -> str:
+    start0 = rec["start"] - 1
+    sizes = [e - s + 1 for s, e in rec["exons"]]
+    offsets = [s - 1 - start0 for s, _ in rec["exons"]]
+    return "\t".join(map(str, [
+        rec["chrom"], start0, rec["end"], rec["tx_id"], 0, rec["strand"],
+        start0, rec["end"], 0, len(sizes),
+        ",".join(map(str, sizes)), ",".join(map(str, offsets))]))
+
+
+def write_biotype_beds(records: list[dict], outdir: Path) -> dict[str, int]:
+    by_biotype: dict[str, list[str]] = {}
+    for r in records:
+        if not SAFE_BIOTYPE.fullmatch(r["tx_biotype"]):
+            raise BuilderError(f"unsafe transcript biotype name {r['tx_biotype']!r}; "
+                               "it becomes a file name")
+        by_biotype.setdefault(r["tx_biotype"], []).append(bed12(r))
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for biotype, lines in by_biotype.items():
+        (outdir / f"{biotype}_transcripts.bed").write_text("\n".join(lines) + "\n")
+    return {b: len(v) for b, v in by_biotype.items()}
+
+
+# ──────────────────────────────────────────────
+# FASTA
+# ──────────────────────────────────────────────
+
+def fasta_ids(path: Path):
+    with _open_text(Path(path)) as fh:
+        for ln in fh:
+            if ln.startswith(">"):
+                yield ln[1:].split()[0] if ln[1:].strip() else ""
+
+
+def decoy_names(path: Path) -> list[str]:
+    return list(fasta_ids(path))
+
+
+def filter_fasta(paths: list[Path], keep_ids: set[str], out: Path) -> dict:
+    """Write records whose ID is in keep_ids, each ID once, in input order."""
+    seen: set[str] = set()
+    stats = {"kept": 0, "dropped": 0, "duplicates": 0}
+    with open(out, "w") as w:
+        for p in paths:
+            write = False
+            with _open_text(Path(p)) as fh:
+                for ln in fh:
+                    if ln.startswith(">"):
+                        rid = ln[1:].split()[0] if ln[1:].strip() else ""
+                        if rid in seen:
+                            stats["duplicates"] += 1
+                            write = False
+                        elif rid in keep_ids:
+                            seen.add(rid)
+                            stats["kept"] += 1
+                            write = True
+                        else:
+                            stats["dropped"] += 1
+                            write = False
+                    if write:
+                        w.write(ln if ln.endswith("\n") else ln + "\n")
+    return stats
+
+
+def missing_from_tx2gene(ids, known: set[str]) -> list[str]:
+    return sorted(i for i in ids if i not in known)
+
+
+# ──────────────────────────────────────────────
+# Index commands and checks
+# ──────────────────────────────────────────────
+
+def star_index_command(genome_fa: Path, gtf: Path, outdir: Path, threads: int,
+                       sjdb_overhang: int = 100) -> list[str]:
+    return ["STAR", "--runMode", "genomeGenerate", "--runThreadN", str(threads),
+            "--genomeDir", str(outdir), "--genomeFastaFiles", str(genome_fa),
+            "--sjdbGTFfile", str(gtf), "--sjdbOverhang", str(sjdb_overhang)]
+
+
+def salmon_index_command(gentrome: Path, decoys: Path, outdir: Path, threads: int) -> list[str]:
+    return ["salmon", "index", "-t", str(gentrome), "-d", str(decoys),
+            "-i", str(outdir), "-p", str(threads)]
+
+
+def md5_matches(path: Path, expected: str) -> bool:
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest() == expected.lower()
+
+
+def _expected_md5(md5_file: Path, name: str) -> str:
+    for ln in Path(md5_file).read_text().splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and Path(parts[1]).name == name:
+            return parts[0]
+    raise BuilderError(f"{name} not listed in {md5_file}")
+
+
+# ──────────────────────────────────────────────
+# prepare
+# ──────────────────────────────────────────────
+
+def prepare(downloads: Path, out: Path, versions: str = "auto") -> dict:
+    d, out = Path(downloads), Path(out)
+    need = ["genome.fna.gz", "ncbi_md5checksums.txt", "ensembl104.gtf.gz",
+            "ensembl104.cdna.fa.gz", "ensembl104.ncrna.fa.gz"]
+    missing = [n for n in need if not (d / n).is_file()]
+    if missing:
+        raise BuilderError(f"missing download(s) in {d}: {', '.join(missing)}")
+    if not md5_matches(d / "genome.fna.gz", _expected_md5(d / "ncbi_md5checksums.txt", GENOME_MD5_NAME)):
+        raise BuilderError("genome.fna.gz does not match NCBI's md5; re-download it")
+
+    work = out / "_work"
+    work.mkdir(parents=True, exist_ok=True)
+    star_dir, salmon_dir = out / STAR_DIR, out / SALMON_DIR
+    star_dir.mkdir(parents=True, exist_ok=True)
+    (out / TX2GENE_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+    # genome: decompress once, collect contig names
+    contigs: set[str] = set()
+    with gzip.open(d / "genome.fna.gz", "rt") as src, open(work / "genome.fa", "w") as dst:
+        for ln in src:
+            if ln.startswith(">"):
+                contigs.add(ln[1:].split()[0])
+            dst.write(ln)
+
+    # transcript ID style follows the FASTA the Salmon index will be built from
+    first_id = next(fasta_ids(d / "ensembl104.cdna.fa.gz"), "")
+    use_versions = (("." in first_id) if versions == "auto" else versions == "yes")
+
+    with gzip.open(d / "ensembl104.gtf.gz", "rt") as fh:
+        renamed, gtf_stats = rename_gtf(fh, contigs)
+    (star_dir / GTF_NAME).write_text("\n".join(renamed) + "\n")
+
+    recs = transcripts(renamed, with_versions=use_versions)
+    tx_lines = tx2gene_lines(recs)
+    (out / TX2GENE_PATH).write_text("\n".join(tx_lines) + "\n")
+    biotypes = write_biotype_beds(recs, star_dir / "biotypes")
+
+    tx_ids = {ln.split("\t", 1)[0] for ln in tx_lines}
+    fa_stats = filter_fasta([d / "ensembl104.cdna.fa.gz", d / "ensembl104.ncrna.fa.gz"],
+                            tx_ids, work / "transcripts.fa")
+    (work / "decoys.txt").write_text("\n".join(decoy_names(work / "genome.fa")) + "\n")
+    with open(work / "gentrome.fa", "wb") as g:  # transcripts first, then genome
+        for part in ("transcripts.fa", "genome.fa"):
+            with open(work / part, "rb") as p:
+                shutil.copyfileobj(p, g, 1 << 24)
+    kept_ids = set(fasta_ids(work / "transcripts.fa"))
+    report = {
+        "genome_md5_verified": True,
+        "transcript_ids_have_versions": use_versions,
+        "genome_contigs": len(contigs),
+        "gtf": gtf_stats,
+        "transcripts_with_exons": len(recs),
+        "tx2gene_rows": len(tx_lines),
+        "biotype_files": biotypes,
+        "transcript_fasta": fa_stats,
+        "gtf_transcripts_without_fasta_sequence": len(tx_ids - kept_ids),
+        "layout": {"gtf": str(out / STAR_DIR / GTF_NAME), "tx2gene": str(out / TX2GENE_PATH),
+                   "biotypes_dir": str(star_dir / "biotypes"),
+                   "star_index_dir": str(star_dir / "index_ensemble"),
+                   "salmon_index_dir": str(salmon_dir / "index"),
+                   "work": str(work)},
+    }
+    (out / "prepare_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="bj-reference-builder", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prepare", help="Rename GTF, write tx2gene and biotype BEDs, filter transcripts, make decoys")
+    p.add_argument("--downloads", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True, help="Root to pass as --genomes-base")
+    p.add_argument("--versions", choices=("auto", "yes", "no"), default="auto",
+                   help="Put .version on transcript/gene IDs (auto = follow the Ensembl FASTA)")
+    args = ap.parse_args(argv)
+    try:
+        report = prepare(args.downloads, args.out, args.versions)
+    except BuilderError as exc:
+        print(f"bj-reference-builder: error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({k: report[k] for k in ("transcripts_with_exons", "tx2gene_rows",
+                                             "transcript_fasta", "transcript_ids_have_versions")}, indent=2))
+    print(f"Report: {args.out / 'prepare_report.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
