@@ -309,10 +309,13 @@ def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path) -> dic
 
 def build_command(pipeline_dir: str, params_file: Path, work_dir: Path,
                   profile: str, resume: bool,
-                  extra_config: Path | None = None) -> list[str]:
+                  extra_config: Path | None = None,
+                  trace: Path | None = None) -> list[str]:
     cmd = ["nextflow", "run", str(Path(pipeline_dir) / "main.nf"),
            "-params-file", str(params_file), "-work-dir", str(work_dir),
            "-ansi-log", "false"]
+    if trace is not None:
+        cmd += ["-with-trace", str(trace)]
     if extra_config is not None:
         cmd += ["-c", str(extra_config)]
     if profile != "docker":  # docker is enabled by the pipeline's own config
@@ -335,6 +338,34 @@ def run_nextflow(cmd: list[str], run_dir: Path,
         proc = subprocess.run(cmd, cwd=run_dir, stdout=so, stderr=se, env=env)
     tail = "\n".join(err_log.read_text(errors="replace").splitlines()[-40:])
     return proc.returncode, tail
+
+
+FAILED_STATES = ("FAILED", "ABORTED")
+
+
+def parse_trace(path: Path) -> dict | None:
+    """Summarise a Nextflow trace by each task's FINAL state.
+
+    BJ-Expression sets errorStrategy to retry twice and then *ignore*, so a run
+    can exit 0 with steps missing. A task name whose last row is FAILED/ABORTED
+    was ignored; one that failed and later completed was only retried.
+    Returns None if the trace is missing or has no name/status columns.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if not reader.fieldnames or not {"name", "status"} <= set(reader.fieldnames):
+            return None
+        history: dict[str, list[str]] = {}
+        for row in reader:
+            if row.get("name"):
+                history.setdefault(row["name"], []).append((row.get("status") or "").strip())
+    ignored = sorted(n for n, h in history.items() if h[-1] in FAILED_STATES)
+    retried = sorted(n for n, h in history.items()
+                     if h[-1] not in FAILED_STATES and any(x in FAILED_STATES for x in h))
+    return {"tasks": len(history), "ignored_failures": ignored, "retried_tasks": retried}
 
 
 def collect_outputs(results_dir: Path, samples: list[str]) -> dict:
@@ -403,6 +434,19 @@ def write_report(out_dir: Path, result: dict) -> Path:
                   ""]
     if status == "failed":
         lines += ["## Nextflow stderr (tail)", "", "```", result["stderr_tail"], "```", ""]
+
+    ignored_tasks = result.get("ignored_failures")
+    if ignored_tasks:
+        lines += ["## Tasks that failed and were ignored", "",
+                  "BJ-Expression retries a failed task twice and then ignores it, so the "
+                  "run continues and can exit 0. These tasks did not finish:", ""]
+        lines += [f"- `{t}`" for t in ignored_tasks]
+        lines += ["", "Anything downstream of them may be missing or partial. Check "
+                  "`nextflow_run/trace.tsv` and the task work directories.", ""]
+    elif ignored_tasks is None and status in ("success", "success_with_ignored_failures",
+                                              "incomplete"):
+        lines += ["> **No Nextflow trace was available**, so ignored task failures could "
+                  "not be checked. Do not read this status as proof every step finished.", ""]
 
     overridden = sorted(set(result["params"]) - {"input_csv", "publish_dir",
                                                  "timestamp", "genome"})
@@ -503,6 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-memory", type=_memory)
     p.add_argument("--genomes-base", help="Mirror of the reference bundle (default: BioSkryb's public S3)")
     p.add_argument("--resume", action="store_true", help="Pass -resume to Nextflow")
+    p.add_argument("--strict", action="store_true",
+                   help="Exit 1 if any task failed and was ignored by the pipeline")
     p.add_argument("--nextflow-version", type=_nxf_version,
                    default=DEFAULT_NEXTFLOW_VERSION,
                    help=f"Nextflow release to run (default {DEFAULT_NEXTFLOW_VERSION}; "
@@ -571,7 +617,7 @@ def run(args: argparse.Namespace) -> int:
     run_dir = out_dir / "nextflow_run"
     cmd = build_command(pipeline["path"] if pipeline else "<path-to-bj-expression-checkout>",
                         repro / "params.json", out_dir / "work", args.profile, args.resume,
-                        kept_config)
+                        kept_config, run_dir / "trace.tsv")
     pin = "" if args.nextflow_version == "system" else f"NXF_VER={args.nextflow_version} "
     command_text = f"cd {shlex.quote(str(run_dir))} && {pin}{shlex.join(cmd)}"
 
@@ -597,10 +643,18 @@ def run(args: argparse.Namespace) -> int:
         result["stderr_tail"] = tail
         found = collect_outputs(Path(params["publish_dir"] + "_" + RUN_TIMESTAMP), samples)
         result.update(found)
+        trace = parse_trace(run_dir / "trace.tsv")
+        result["trace"] = ({"available": True, "tasks": trace["tasks"],
+                            "retried_tasks": trace["retried_tasks"]} if trace
+                           else {"available": False, "tasks": 0, "retried_tasks": []})
+        result["ignored_failures"] = trace["ignored_failures"] if trace else None
         if code != 0:
             result["status"], exit_code = "failed", 1
         elif found["missing_outputs"]:
             result["status"], exit_code = "incomplete", 1
+        elif result["ignored_failures"]:
+            result["status"] = "success_with_ignored_failures"
+            exit_code = 1 if args.strict else 0
         else:
             result["status"] = "success"
 
@@ -616,6 +670,13 @@ def run(args: argparse.Namespace) -> int:
               + ", ".join(result["missing_outputs"]), file=sys.stderr)
     else:
         print(f"{PROG}: {result['status']} -> {out_dir / 'report.md'}")
+    if result["status"] == "success_with_ignored_failures":
+        names = ", ".join(result["ignored_failures"])
+        msg = f"tasks failed and were ignored by the pipeline: {names}"
+        if exit_code:
+            print(f"{PROG}: error: {msg} (--strict)", file=sys.stderr)
+        else:
+            print(f"{PROG}: WARNING: {msg}")
     return exit_code
 
 

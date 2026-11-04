@@ -770,11 +770,12 @@ SKILLS = {
             "--genome", "--profile", "--n-reads", "--read-length", "--min-reads",
             "--seed", "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots",
             "--instrument", "--max-cpus", "--max-memory", "--genomes-base",
-            "--resume",
+            "--resume", "--strict",
         },
         "allowed_extra_flags_without_values": {
             "--check", "--accept-bioskryb-terms", "--allow-dirty-pipeline",
             "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots", "--resume",
+            "--strict",
         },
         "accepts_genotypes": False,
     },

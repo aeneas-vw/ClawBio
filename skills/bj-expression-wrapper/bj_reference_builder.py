@@ -246,6 +246,82 @@ def _expected_md5(md5_file: Path, name: str) -> str:
 
 
 # ──────────────────────────────────────────────
+# Housekeeping-gene BED (genebody_ref)
+# ──────────────────────────────────────────────
+
+HOUSEKEEPING_BED = "hg38.HouseKeepingGenes.bed"  # name the pipeline's config uses
+
+
+def parse_gene_list(text: str) -> list[tuple[str, str]]:
+    """Two columns, Ensembl gene ID then symbol. Versions are stripped: the list
+    comes from a different annotation release than the GTF, so versions differ."""
+    genes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for n, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not re.fullmatch(r"ENSG\d+(\.\d+)?", parts[0]):
+            raise BuilderError(f"gene list line {n}: expected 'ENSG... SYMBOL', got {raw!r}")
+        gid = parts[0].split(".")[0]
+        if gid not in seen:
+            seen.add(gid)
+            genes.append((gid, parts[1]))
+    return genes
+
+
+def housekeeping_bed(records: list[dict], genes: list[tuple[str, str]]):
+    """12-column BED of every transcript of the listed genes, matched on the
+    unversioned gene ID. Symbol disagreements and misses are reported."""
+    by_gene: dict[str, list[dict]] = {}
+    by_symbol: dict[str, set[str]] = {}
+    for r in records:
+        gid = r["gene_id"].split(".")[0]
+        by_gene.setdefault(gid, []).append(r)
+        by_symbol.setdefault(r["symbol"], set()).add(gid)
+    wanted = {gid for gid, _ in genes if gid in by_gene}
+    unmatched, mismatch, symbol_only = [], [], []
+    for gid, sym in genes:
+        if gid in by_gene:
+            gtf_sym = by_gene[gid][0]["symbol"]
+            if gtf_sym != sym:
+                mismatch.append([gid, sym, gtf_sym])
+        else:
+            unmatched.append(gid)
+            hit = sorted(by_symbol.get(sym, ()))
+            if hit:
+                symbol_only.append([gid, sym, hit[0]])
+    lines = [bed12(r) for r in records if r["gene_id"].split(".")[0] in wanted]
+    if not lines:
+        raise BuilderError("no housekeeping genes matched the annotation by gene ID; "
+                           "an empty BED would silently produce no gene-body coverage")
+    return lines, {
+        "requested": len(genes), "matched_genes": sorted(wanted), "transcripts": len(lines),
+        "per_gene_transcripts": {g: len(by_gene[g]) for g in sorted(wanted)},
+        "unmatched": unmatched, "symbol_mismatch": mismatch, "symbol_only": symbol_only}
+
+
+def write_housekeeping(out: Path, genes_file: Path) -> dict:
+    out = Path(out)
+    prep = out / "prepare_report.json"
+    gtf = out / STAR_DIR / GTF_NAME
+    if not prep.is_file() or not gtf.is_file():
+        raise BuilderError(f"{out} has no prepared references; run 'prepare' first")
+    versions = json.loads(prep.read_text())["transcript_ids_have_versions"]
+    genes = parse_gene_list(Path(genes_file).read_text())
+    with open(gtf) as fh:
+        recs = transcripts(fh, with_versions=versions)
+    lines, report = housekeeping_bed(recs, genes)
+    bed = out / STAR_DIR / HOUSEKEEPING_BED
+    bed.write_text("\n".join(lines) + "\n")
+    report["genes_file_sha256"] = hashlib.sha256(Path(genes_file).read_bytes()).hexdigest()
+    report["bed"] = str(bed)
+    (out / "housekeeping_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
+# ──────────────────────────────────────────────
 # prepare
 # ──────────────────────────────────────────────
 
@@ -323,7 +399,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True, help="Root to pass as --genomes-base")
     p.add_argument("--versions", choices=("auto", "yes", "no"), default="auto",
                    help="Put .version on transcript/gene IDs (auto = follow the Ensembl FASTA)")
+    h = sub.add_parser("housekeeping", help="Write the 12-column housekeeping-gene BED (genebody_ref)")
+    h.add_argument("--genes", type=Path, required=True,
+                   help="Two columns: Ensembl gene ID (version optional), symbol")
+    h.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
     args = ap.parse_args(argv)
+    if args.cmd == "housekeeping":
+        try:
+            rep = write_housekeeping(args.out, args.genes)
+        except BuilderError as exc:
+            print(f"bj-reference-builder: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({k: rep[k] for k in ("requested", "transcripts", "unmatched",
+                                              "symbol_mismatch", "symbol_only")}, indent=2))
+        return 0
     try:
         report = prepare(args.downloads, args.out, args.versions)
     except BuilderError as exc:

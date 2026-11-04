@@ -99,7 +99,7 @@ You are **BJ-Expression Wrapper**, a specialised ClawBio agent for bulk and low-
 2. **Pinned, unmodified source**: refuses a checkout that is not at the pinned tag or has local edits (unless allowed and recorded).
 3. **Preflight**: Java, Nextflow and Docker or Apptainer/Singularity, with every missing item listed at once.
 4. **Minimal overrides**: only values you set are passed; everything else stays BioSkryb's default.
-5. **Honest outcome**: success needs Nextflow exit 0 and the key outputs; samples dropped by the pipeline are listed.
+5. **Honest outcome**: success needs Nextflow exit 0 and the key outputs; samples dropped by the pipeline are listed; tasks the pipeline retried twice and then ignored are read from the Nextflow trace and reported (`success_with_ignored_failures`).
 
 ## Scope
 
@@ -151,7 +151,7 @@ What it writes, and why each format is what it is (all read from the pipeline's 
 | `bed_files_dir` | One `<biotype>_transcripts.bed` per transcript biotype | Read only by the insert-size step; the file-name prefix is the biotype label |
 | Salmon input | Ensembl 104 cDNA + ncRNA, filtered to transcripts present in tx2gene, plus the genome as decoys | Every Salmon transcript must be in tx2gene |
 | `star_index`, Salmon index | Built from the files above (commands: `star_index_command`, `salmon_index_command`) | STAR must be 2.7.6a, the pipeline's version; needs a lot of RAM |
-| `genebody_ref` | 12-column BED of housekeeping-gene transcripts | Needs your gene list; not built by `prepare` |
+| `genebody_ref` | `housekeeping --genes FILE`: 12-column BED of every transcript of the listed genes | List is two columns (Ensembl gene ID, symbol); matched on the unversioned ID because list and GTF versions differ; misses and symbol disagreements go to `housekeeping_report.json` |
 | cell-typing RDS | Not built here | See Gotchas |
 
 ## CLI Reference
@@ -177,7 +177,7 @@ python skills/bj-expression-wrapper/bj_expression_wrapper.py --demo --output ~/s
 
 Optional overrides (each omitted flag keeps the pipeline default): `--n-reads`, `--read-length`, `--min-reads`, `--seed` (the pipeline's seqtk seed), `--skip-subsampling`, `--skip-cutadapt`, `--skip-qc-plots`, `--instrument`, `--genomes-base`.
 
-Wrapper options: `--nextflow-version` (default `25.04.6`, set as `NXF_VER` on every Nextflow call; `system` leaves your install alone) and `--extra-config FILE` (passed to Nextflow with `-c` and copied into the bundle).
+Wrapper options: `--strict` (exit 1 when any task failed and was ignored, instead of exit 0 with a warning), `--nextflow-version` (default `25.04.6`, set as `NXF_VER` on every Nextflow call; `system` leaves your install alone) and `--extra-config FILE` (passed to Nextflow with `-c` and copied into the bundle).
 
 ## Hosts without Docker (for example a gVisor container)
 
@@ -260,7 +260,7 @@ Docker needs a Carolina Cloud VM; containers cannot run it. The README suggests 
 - **The model will want to use the newest Nextflow. Do not.** Nextflow 26.x cannot parse this pipeline's config (it includes two profile files that are not in the public repo). 25.04.6 and 24.10.5 parse it (config parse only; a full run on 24.10.5 was not tried). The wrapper pins 25.04.6.
 - **The model will want to say the sandbox workaround is proven. It is not.** It was tested end to end with Nextflow 25.04.6 and one real image (seqtk 1.3) only. Whether other images, or many tasks sharing one writable sandbox, behave the same is untested.
 - **The model will want to treat a SingleR RDS as a drop-in `db_celltype_qbio.RDS`. It is not.** The pipeline's cell-typing script reads a named list with `HPCA_singleR` (labels `label.main2`) and four BioSkryb-built references `GTEx_singleR`, `GTExmeds_singleR`, `TCGA_STN_singleR`, `TCGA_PT_singleR` (labels `Treatment`). Other lists fail that step, and the pipeline then retries twice and ignores the failure.
-- **The pipeline ignores failed tasks after two retries.** A run can exit 0 with steps missing. Do not report a clean run from the exit code alone.
+- **The pipeline ignores failed tasks after two retries.** A run can exit 0 with steps missing. The wrapper reads Nextflow's trace and sets `status` to `success_with_ignored_failures` and lists the tasks; never report a clean run from the exit code alone. If no trace was written, `ignored_failures` is `null`, which means unknown, not none.
 - **The model will want to clone or vendor the pipeline for the user. Do not.** It is under BioSkryb's terms, not an open-source licence. The user fetches it and passes `--pipeline-dir`; the wrapper never downloads it.
 - **The model will want to say every input sample was analysed. Do not.** Samples below `min_reads` are dropped before quantification and simply absent from the counts. Read `samples_missing_from_outputs` in `result.json`.
 - **The model will want to treat Nextflow exit 0 as success. Do not.** The wrapper also requires the key outputs; otherwise the status is `incomplete`.

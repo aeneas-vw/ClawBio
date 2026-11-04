@@ -79,6 +79,18 @@ for s in samples:
 for f in files:
     os.makedirs(os.path.dirname(f), exist_ok=True)
     open(f, "w").write("fake\\n")
+tr = os.environ.get("FAKE_NF_TRACE", "clean")
+if "-with-trace" in args and tr != "none":
+    tp = args[args.index("-with-trace") + 1]
+    rows = ["1\\tab\\t-\\tRNASEQ_WF:STARALIGN (s1)\\tCOMPLETED\\t0"]
+    if tr == "ignored":
+        rows += ["2\\tcd\\t-\\tRNASEQ_WF:CELL_TYPING (CELL_TYPING)\\tFAILED\\t1",
+                 "2\\tcd\\t-\\tRNASEQ_WF:CELL_TYPING (CELL_TYPING)\\tFAILED\\t1"]
+    if tr == "retry_ok":
+        rows += ["3\\tef\\t-\\tRNASEQ_WF:SALMONQUANT (s2)\\tFAILED\\t137",
+                 "3\\tef\\t-\\tRNASEQ_WF:SALMONQUANT (s2)\\tCOMPLETED\\t0"]
+    with open(tp, "w") as fh:
+        fh.write("task_id\\thash\\tnative_id\\tname\\tstatus\\texit\\n" + "\\n".join(rows) + "\\n")
 """
 
 FAKE_JAVA = '#!/bin/sh\necho \'openjdk version "17.0.9" 2023-10-17\' >&2\n'
@@ -681,3 +693,93 @@ def test_relative_output_dir_works_because_nextflow_runs_elsewhere(setup):
     r = json.loads((setup["tmp"] / "rel_out" / "result.json").read_text())
     assert r["status"] == "success", res.stderr
     assert Path(r["outputs"]["results_dir"]).is_absolute()
+
+
+# ──────────────────────────────────────────────
+# Ignored task failures (the pipeline retries twice, then ignores)
+# ──────────────────────────────────────────────
+
+def test_command_asks_nextflow_for_a_trace_under_the_run_dir(setup):
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
+    cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
+    assert f"-with-trace {setup['out'] / 'nextflow_run' / 'trace.tsv'}" in cmd
+
+
+def test_clean_trace_means_no_ignored_failures(setup):
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
+    r = result_json(setup["out"])
+    assert r["status"] == "success"
+    assert r["ignored_failures"] == [] and r["trace"]["available"] is True
+    assert r["trace"]["tasks"] >= 1
+
+
+def test_ignored_failure_is_reported_but_the_run_still_exits_zero(setup):
+    env = {**setup["env"], "FAKE_NF_TRACE": "ignored"}
+    res = run_cli(base_args(setup, "--accept-bioskryb-terms"), env=env)
+    r = result_json(setup["out"])
+    assert r["status"] == "success_with_ignored_failures"
+    assert r["ignored_failures"] == ["RNASEQ_WF:CELL_TYPING (CELL_TYPING)"]
+    text = (setup["out"] / "report.md").read_text()
+    assert "CELL_TYPING" in text and "ignored" in text.lower()
+    assert "ignored" in res.stdout.lower()
+
+
+def test_strict_turns_ignored_failures_into_a_nonzero_exit(setup):
+    env = {**setup["env"], "FAKE_NF_TRACE": "ignored"}
+    res = run_cli(base_args(setup, "--accept-bioskryb-terms", "--strict"), env=env, expect=1)
+    assert "CELL_TYPING" in res.stderr
+    assert result_json(setup["out"])["status"] == "success_with_ignored_failures"
+
+
+def test_a_task_that_failed_then_succeeded_is_a_retry_not_a_failure(setup):
+    env = {**setup["env"], "FAKE_NF_TRACE": "retry_ok"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--strict"), env=env)
+    r = result_json(setup["out"])
+    assert r["status"] == "success" and r["ignored_failures"] == []
+    assert r["trace"]["retried_tasks"] == ["RNASEQ_WF:SALMONQUANT (s2)"]
+
+
+def test_missing_trace_is_said_not_assumed_clean(setup):
+    env = {**setup["env"], "FAKE_NF_TRACE": "none"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=env)
+    r = result_json(setup["out"])
+    assert r["trace"]["available"] is False and r["ignored_failures"] is None
+    assert "trace" in (setup["out"] / "report.md").read_text().lower()
+
+
+def test_parse_trace_uses_the_final_state_of_each_task(tmp_path):
+    mod = _load_module()
+    p = tmp_path / "t.tsv"
+    p.write_text("task_id\thash\tnative_id\tname\tstatus\texit\n"
+                 "1\ta\t-\tA (x)\tFAILED\t1\n1\ta\t-\tA (x)\tCOMPLETED\t0\n"
+                 "2\tb\t-\tB (y)\tCOMPLETED\t0\n2\tb\t-\tB (y)\tFAILED\t1\n"
+                 "3\tc\t-\tC (z)\tCACHED\t0\n")
+    t = mod.parse_trace(p)
+    assert t["ignored_failures"] == ["B (y)"] and t["retried_tasks"] == ["A (x)"]
+    assert t["tasks"] == 3
+
+
+def test_parse_trace_on_a_missing_or_headerless_file_is_none(tmp_path):
+    mod = _load_module()
+    assert mod.parse_trace(tmp_path / "nope.tsv") is None
+    p = tmp_path / "bad.tsv"
+    p.write_text("not a trace\n")
+    assert mod.parse_trace(p) is None
+
+
+@settings(deadline=None, max_examples=80)
+@given(seqs=st.dictionaries(
+    st.from_regex(r"[A-Z]{1,6} \([a-z0-9]{1,4}\)", fullmatch=True),
+    st.lists(st.sampled_from(["COMPLETED", "FAILED", "CACHED", "ABORTED"]), min_size=1, max_size=4),
+    min_size=1, max_size=6))
+def test_property_a_task_is_ignored_iff_its_last_state_failed(tmp_path_factory, seqs):
+    mod = _load_module()
+    p = tmp_path_factory.mktemp("tr") / "t.tsv"
+    rows = ["task_id\thash\tnative_id\tname\tstatus\texit"]
+    for name, states in seqs.items():
+        rows += [f"1\tx\t-\t{name}\t{st_}\t0" for st_ in states]
+    p.write_text("\n".join(rows) + "\n")
+    t = mod.parse_trace(p)
+    expect = sorted(n for n, s_ in seqs.items() if s_[-1] in ("FAILED", "ABORTED"))
+    assert t["ignored_failures"] == expect
+    assert t["tasks"] == len(seqs)

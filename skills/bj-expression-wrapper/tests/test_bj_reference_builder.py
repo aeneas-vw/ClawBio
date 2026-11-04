@@ -12,6 +12,7 @@ cDNA/ncRNA FASTAs. Formats were read from the pipeline's own scripts:
 """
 
 import gzip
+import json
 import importlib.util
 import re
 import sys
@@ -359,3 +360,84 @@ def test_cli_prepare_runs_and_reports(tmp_path, capsys):
                      "--out", str(tmp_path / "refs")])
     assert code == 0 and "tx2gene_rows" in capsys.readouterr().out
     assert (tmp_path / "refs" / "prepare_report.json").exists()
+
+
+# ──────────────────────────────────────────────
+# Housekeeping-gene BED (genebody_ref)
+# ──────────────────────────────────────────────
+# The list carries gene versions from a different annotation than Ensembl 104
+# (e.g. ENSG00000075624.17), so genes are matched on the UNVERSIONED gene ID.
+
+def test_gene_list_strips_versions_and_ignores_blanks_and_comments():
+    mod = load()
+    text = "# housekeeping\nENSG1.17\tGENE1\n\n  ENSG2.5   GENE2  \nENSG1.9\tGENE1\n"
+    assert mod.parse_gene_list(text) == [("ENSG1", "GENE1"), ("ENSG2", "GENE2")]
+
+
+@pytest.mark.parametrize("bad", ["ENSG1.17\n", "ENSG1.17 A B\n", "notanid\tGENE\n"])
+def test_gene_list_rejects_malformed_lines_with_a_line_number(bad):
+    mod = load()
+    with pytest.raises(mod.BuilderError, match="line 1"):
+        mod.parse_gene_list(bad)
+
+
+def _recs():
+    mod = load()
+    return mod.transcripts([
+        *tx_block("chr1", gene="ENSG1", tx="ENST1", symbol="GENE1", gver="3"),
+        *tx_block("chr1", gene="ENSG1", tx="ENST1b", symbol="GENE1", gver="3", exons=((1000, 1100),)),
+        *tx_block("chr2", gene="ENSG2", tx="ENST2", symbol="GENE2", gver="1"),
+        *tx_block("chr3", gene="ENSG3", tx="ENST3", symbol="GENE3", gver="1")])
+
+
+def test_housekeeping_matches_on_unversioned_id_and_keeps_every_transcript():
+    mod = load()
+    lines, rep = mod.housekeeping_bed(_recs(), [("ENSG1", "GENE1"), ("ENSG2", "GENE2")])
+    assert len(lines) == 3 and all(len(x.split("\t")) == 12 for x in lines)
+    assert rep["per_gene_transcripts"] == {"ENSG1": 2, "ENSG2": 1}
+    assert rep["unmatched"] == [] and rep["symbol_mismatch"] == [] and rep["symbol_only"] == []
+    assert {x.split("\t")[3] for x in lines} == {"ENST1.2", "ENST1b.2", "ENST2.2"}
+
+
+def test_unmatched_and_symbol_disagreement_are_reported_not_hidden():
+    mod = load()
+    lines, rep = mod.housekeeping_bed(_recs(), [("ENSG1", "WRONGNAME"), ("ENSG9", "NOPE")])
+    assert rep["unmatched"] == ["ENSG9"]
+    assert rep["symbol_mismatch"] == [["ENSG1", "WRONGNAME", "GENE1"]]
+    assert len(lines) == 2, "an ID match is kept even when the symbol differs"
+
+
+def test_symbol_only_match_is_excluded_but_reported():
+    mod = load()
+    lines, rep = mod.housekeeping_bed(_recs(), [("ENSG1", "GENE1"), ("ENSG77", "GENE2")])
+    assert rep["symbol_only"] == [["ENSG77", "GENE2", "ENSG2"]]
+    assert all(x.split("\t")[0] != "chr2" for x in lines)
+
+
+def test_no_matches_is_an_error_not_an_empty_bed():
+    mod = load()
+    with pytest.raises(mod.BuilderError, match="no housekeeping genes"):
+        mod.housekeeping_bed(_recs(), [("ENSG9", "NOPE")])
+
+
+def test_housekeeping_command_writes_the_file_the_pipeline_names(tmp_path):
+    mod = load()
+    out = tmp_path / "refs"
+    mod.prepare(make_downloads(tmp_path), out)
+    genes = tmp_path / "genes.tsv"
+    genes.write_text("ENSG1.17\tGENE1\nENSG2.4\tMT-ND1\n")
+    assert mod.main(["housekeeping", "--genes", str(genes), "--out", str(out)]) == 0
+    bed = out / "genomes/Homo_sapiens/NCBI/GRCh38/Sequence/star_chr_eqnames_wgs/hg38.HouseKeepingGenes.bed"
+    rows = bed.read_text().splitlines()
+    assert [r.split("\t")[3] for r in rows] == ["ENST1.2", "ENST2.2"]
+    assert all(len(r.split("\t")) == 12 for r in rows)
+    rep = json.loads((out / "housekeeping_report.json").read_text())
+    assert rep["unmatched"] == []
+
+
+def test_housekeeping_command_before_prepare_is_a_clear_error(tmp_path, capsys):
+    mod = load()
+    g = tmp_path / "g.tsv"
+    g.write_text("ENSG1.1\tA\n")
+    assert mod.main(["housekeeping", "--genes", str(g), "--out", str(tmp_path / "empty")]) == 1
+    assert "prepare" in capsys.readouterr().err
