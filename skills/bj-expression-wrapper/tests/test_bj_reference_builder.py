@@ -441,3 +441,157 @@ def test_housekeeping_command_before_prepare_is_a_clear_error(tmp_path, capsys):
     g.write_text("ENSG1.1\tA\n")
     assert mod.main(["housekeeping", "--genes", str(g), "--out", str(tmp_path / "empty")]) == 1
     assert "prepare" in capsys.readouterr().err
+
+
+# ──────────────────────────────────────────────
+# build-indexes: STAR and Salmon inside the sandboxes, with a RAM guard
+# ──────────────────────────────────────────────
+# A human STAR index can exceed this container's RAM; an OOM kill restarts the
+# container and loses background work, so we refuse to start without headroom.
+
+import os as _os
+import stat as _stat
+
+FAKE_APPTAINER_IDX = f"""#!{sys.executable}
+import json, os, sys
+a = sys.argv[1:]
+with open(os.environ["FAKE_IDX_LOG"], "a") as fh:
+    fh.write(json.dumps({{"args": a, "cwd": os.getcwd()}}) + "\\n")
+if os.environ.get("FAKE_IDX_FAIL"):
+    sys.exit(0)  # pretend success but produce nothing
+if "STAR" in a:
+    d = a[a.index("--genomeDir") + 1]
+    os.makedirs(d, exist_ok=True)
+    for n in ("Genome", "SA", "SAindex", "genomeParameters.txt", "chrName.txt"):
+        open(os.path.join(d, n), "w").write("x")
+if "salmon" in a:
+    d = a[a.index("-i") + 1]
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "info.json"), "w").write("{{}}")
+"""
+
+MEM_OK = "MemTotal: 70000000 kB\nMemFree: 1000 kB\nMemAvailable: 60000000 kB\n"   # ~57 GiB
+MEM_LOW = "MemTotal: 37000000 kB\nMemFree: 1000 kB\nMemAvailable: 23000000 kB\n"  # ~22 GiB
+
+
+def idx_env(tmp_path, monkeypatch):
+    b = tmp_path / "bin"
+    b.mkdir()
+    exe = b / "apptainer"
+    exe.write_text(FAKE_APPTAINER_IDX)
+    exe.chmod(exe.stat().st_mode | _stat.S_IEXEC)
+    log = tmp_path / "idx.log"
+    monkeypatch.setenv("PATH", str(b))
+    monkeypatch.setenv("FAKE_IDX_LOG", str(log))
+    monkeypatch.delenv("FAKE_IDX_FAIL", raising=False)
+    sb = tmp_path / "sandboxes"
+    for im in ("quay.io-biocontainers-star-2.7.6a--0.img",
+               "quay.io-biocontainers-salmon-1.6.0--h84f40af_0.img"):
+        (sb / im).mkdir(parents=True)
+    return log, sb
+
+
+def prepared_refs(mod, tmp_path):
+    out = tmp_path / "refs"
+    mod.prepare(make_downloads(tmp_path), out)
+    return out
+
+
+def idx_calls(log):
+    return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_available_memory_is_parsed_from_meminfo():
+    mod = load()
+    assert abs(mod.available_memory_gb(MEM_OK) - 60000000 / 1024 / 1024) < 1e-6
+    with pytest.raises(mod.BuilderError, match="MemAvailable"):
+        mod.available_memory_gb("MemTotal: 1 kB\n")
+
+
+@settings(deadline=None, max_examples=50)
+@given(kb=st.integers(0, 10**9))
+def test_property_memory_parse_roundtrips(kb):
+    mod = load()
+    assert mod.available_memory_gb(f"MemAvailable:   {kb} kB\n") == kb / 1024 / 1024
+
+
+def test_low_memory_refuses_before_running_anything_and_mentions_the_resize(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    with pytest.raises(mod.BuilderError, match="resize"):
+        mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_LOW)
+    assert idx_calls(log) == [], "must not start STAR when it could be OOM-killed"
+    assert not (out / mod.STAR_DIR / "index_ensemble").exists()
+
+
+def test_both_indexes_are_built_in_their_sandboxes_with_the_prepared_files(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    rep = mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+    calls = idx_calls(log)
+    star = next(c for c in calls if "STAR" in c["args"])["args"]
+    salmon = next(c for c in calls if "salmon" in c["args"])["args"]
+    assert star[:2] == ["exec", "--writable"] and "star-2.7.6a" in " ".join(star)
+    assert str(out / mod.STAR_DIR / mod.GTF_NAME) in star and str(out / "_work/genome.fa") in star
+    assert "salmon-1.6.0" in " ".join(salmon)
+    assert str(out / "_work/gentrome.fa") in salmon and str(out / "_work/decoys.txt") in salmon
+    assert (out / mod.STAR_DIR / "index_ensemble" / "Genome").is_file()
+    assert (out / mod.SALMON_DIR / "index" / "info.json").is_file()
+    assert rep["star"] == "built" and rep["salmon"] == "built"
+    assert all(str(out) in " ".join(c["args"]) for c in calls)  # home/out is bound
+
+
+def test_star_runs_in_the_work_dir_so_its_scratch_files_stay_under_the_output(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+    star_call = next(c for c in idx_calls(log) if "STAR" in c["args"])
+    assert Path(star_call["cwd"]).resolve() == (out / "_work").resolve()
+
+
+def test_existing_complete_indexes_are_skipped(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+    n = len(idx_calls(log))
+    rep = mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+    assert rep["star"] == "skipped" and rep["salmon"] == "skipped"
+    assert len(idx_calls(log)) == n
+
+
+def test_an_index_that_comes_out_incomplete_is_an_error_not_a_success(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    monkeypatch.setenv("FAKE_IDX_FAIL", "1")
+    with pytest.raises(mod.BuilderError, match="incomplete"):
+        mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+
+
+def test_only_flag_builds_just_that_index(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    rep = mod.build_indexes(out, sb, threads=4, only="salmon", meminfo_text=MEM_LOW)
+    assert rep["salmon"] == "built" and "star" not in rep, "Salmon needs less RAM than STAR"
+
+
+def test_build_indexes_needs_prepare_first(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    with pytest.raises(mod.BuilderError, match="prepare"):
+        mod.build_indexes(tmp_path / "empty", sb, threads=4, meminfo_text=MEM_OK)
+
+
+def test_missing_sandbox_names_the_image_and_the_fix(tmp_path, monkeypatch):
+    mod = load()
+    log, sb = idx_env(tmp_path, monkeypatch)
+    out = prepared_refs(mod, tmp_path)
+    import shutil as _sh
+    _sh.rmtree(sb / "quay.io-biocontainers-star-2.7.6a--0.img")
+    with pytest.raises(mod.BuilderError, match="apptainer_sandboxes"):
+        mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)

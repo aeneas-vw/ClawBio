@@ -218,10 +218,13 @@ def missing_from_tx2gene(ids, known: set[str]) -> list[str]:
 # ──────────────────────────────────────────────
 
 def star_index_command(genome_fa: Path, gtf: Path, outdir: Path, threads: int,
-                       sjdb_overhang: int = 100) -> list[str]:
-    return ["STAR", "--runMode", "genomeGenerate", "--runThreadN", str(threads),
-            "--genomeDir", str(outdir), "--genomeFastaFiles", str(genome_fa),
-            "--sjdbGTFfile", str(gtf), "--sjdbOverhang", str(sjdb_overhang)]
+                       sjdb_overhang: int = 100, log_prefix: Path | None = None) -> list[str]:
+    cmd = ["STAR", "--runMode", "genomeGenerate", "--runThreadN", str(threads),
+           "--genomeDir", str(outdir), "--genomeFastaFiles", str(genome_fa),
+           "--sjdbGTFfile", str(gtf), "--sjdbOverhang", str(sjdb_overhang)]
+    if log_prefix is not None:
+        cmd += ["--outFileNamePrefix", str(log_prefix)]
+    return cmd
 
 
 def salmon_index_command(gentrome: Path, decoys: Path, outdir: Path, threads: int) -> list[str]:
@@ -322,6 +325,116 @@ def write_housekeeping(out: Path, genes_file: Path) -> dict:
 
 
 # ──────────────────────────────────────────────
+# build-indexes: STAR and Salmon inside the sandboxes, with a RAM guard
+# ──────────────────────────────────────────────
+
+# The pipeline aligns with STAR 2.7.6a and quantifies with Salmon 1.6.0, so the
+# indexes are built with exactly those versions (the sandboxes from
+# apptainer_sandboxes.py).
+STAR_IMAGE = "quay.io/biocontainers/star:2.7.6a--0"
+SALMON_IMAGE = "quay.io/biocontainers/salmon:1.6.0--h84f40af_0"
+# Free-memory floors, in GiB. CONSERVATIVE ESTIMATES, not measurements: a human
+# STAR index is commonly quoted at about 30 GB, Salmon with decoys at well under
+# that. An OOM kill restarts the container and loses background work, so we
+# refuse to start without headroom. Override with --min-free-gb-star/-salmon.
+DEFAULT_MIN_FREE_GB = {"star": 40.0, "salmon": 16.0}
+STAR_FILES = ("Genome", "SA", "SAindex", "genomeParameters.txt", "chrName.txt")
+
+
+def available_memory_gb(meminfo_text: str) -> float:
+    m = re.search(r"^MemAvailable:\s+(\d+)\s*kB", meminfo_text, re.M)
+    if not m:
+        raise BuilderError("MemAvailable not found in the memory info")
+    return int(m.group(1)) / 1024 / 1024
+
+
+def _cache_name(image: str) -> str:
+    """The sandbox directory name; one rule, owned by apptainer_sandboxes.py."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "apptainer_sandboxes.py"
+    spec = importlib.util.spec_from_file_location("_bj_apptainer_sandboxes", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.cache_name(image)
+
+
+def _star_complete(d: Path) -> list[str]:
+    return [n for n in STAR_FILES if not (d / n).is_file()]
+
+
+def _salmon_complete(d: Path) -> list[str]:
+    ok = (d / "info.json").is_file() or (d / "versionInfo.json").is_file()
+    return [] if ok else ["info.json or versionInfo.json"]
+
+
+def build_indexes(out: Path, sandboxes: Path, threads: int, only: str | None = None,
+                  sjdb_overhang: int = 100, min_free_gb: dict | None = None,
+                  bind: Path | None = None, meminfo_text: str | None = None) -> dict:
+    import subprocess
+    out, sandboxes = Path(out), Path(sandboxes)
+    work = out / "_work"
+    need = [out / "prepare_report.json", out / STAR_DIR / GTF_NAME,
+            work / "genome.fa", work / "gentrome.fa", work / "decoys.txt"]
+    if not all(p.is_file() for p in need):
+        raise BuilderError(f"{out} has no prepared references; run 'prepare' first")
+    which = ["star", "salmon"] if only is None else [only]
+    apptainer = shutil.which("apptainer") or shutil.which("singularity")
+    if not apptainer:
+        raise BuilderError("apptainer not found on PATH")
+
+    targets = {"star": (out / STAR_DIR / "index_ensemble", _star_complete, STAR_IMAGE),
+               "salmon": (out / SALMON_DIR / "index", _salmon_complete, SALMON_IMAGE)}
+    report: dict[str, str] = {}
+    todo = []
+    for k in which:
+        outdir, complete, image = targets[k]
+        box = sandboxes / _cache_name(image)
+        if not box.is_dir():
+            raise BuilderError(f"sandbox for {image} not found at {box}; run "
+                               "apptainer_sandboxes.py first")
+        if outdir.is_dir() and any(outdir.iterdir()):
+            missing = complete(outdir)
+            if missing:
+                raise BuilderError(f"{outdir} exists but is incomplete (missing "
+                                   f"{', '.join(missing)}); delete it and re-run")
+            report[k] = "skipped"
+        else:
+            todo.append(k)
+
+    floors = {**DEFAULT_MIN_FREE_GB, **(min_free_gb or {})}
+    text = meminfo_text if meminfo_text is not None else Path("/proc/meminfo").read_text()
+    avail = available_memory_gb(text)
+    for k in todo:
+        if avail < floors[k]:
+            raise BuilderError(
+                f"only {avail:.0f} GiB of memory is available; the {k} index needs about "
+                f"{floors[k]:.0f} GiB (an estimate). Ask for more RAM (resize the container), "
+                "then re-run; an out-of-memory kill would restart the container.")
+
+    bind = Path(bind) if bind else Path.home()
+    for k in todo:
+        outdir, complete, image = targets[k]
+        if k == "star":
+            tool = star_index_command(work / "genome.fa", out / STAR_DIR / GTF_NAME, outdir,
+                                      threads, sjdb_overhang, log_prefix=work / "star_")
+        else:
+            tool = salmon_index_command(work / "gentrome.fa", work / "decoys.txt", outdir, threads)
+        outdir.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [apptainer, "exec", "--writable", "--bind", f"{bind}:{bind}",
+               str(sandboxes / _cache_name(image)), *tool]
+        proc = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise BuilderError(f"{k} index build failed (exit {proc.returncode}): "
+                               f"{proc.stderr.strip()[-400:]}")
+        missing = complete(outdir)
+        if missing:
+            raise BuilderError(f"{k} index is incomplete after the build (missing "
+                               f"{', '.join(missing)})")
+        report[k] = "built"
+    return report
+
+
+# ──────────────────────────────────────────────
 # prepare
 # ──────────────────────────────────────────────
 
@@ -399,11 +512,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True, help="Root to pass as --genomes-base")
     p.add_argument("--versions", choices=("auto", "yes", "no"), default="auto",
                    help="Put .version on transcript/gene IDs (auto = follow the Ensembl FASTA)")
+    b = sub.add_parser("build-indexes", help="Build the STAR and Salmon indexes in the sandboxes (needs lots of RAM)")
+    b.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
+    b.add_argument("--sandboxes", type=Path, default=Path.home() / "bj-expression-sandboxes")
+    b.add_argument("--threads", type=int, default=8)
+    b.add_argument("--only", choices=("star", "salmon"))
+    b.add_argument("--sjdb-overhang", type=int, default=100)
+    b.add_argument("--min-free-gb-star", type=float, default=DEFAULT_MIN_FREE_GB["star"])
+    b.add_argument("--min-free-gb-salmon", type=float, default=DEFAULT_MIN_FREE_GB["salmon"])
     h = sub.add_parser("housekeeping", help="Write the 12-column housekeeping-gene BED (genebody_ref)")
     h.add_argument("--genes", type=Path, required=True,
                    help="Two columns: Ensembl gene ID (version optional), symbol")
     h.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
     args = ap.parse_args(argv)
+    if args.cmd == "build-indexes":
+        try:
+            rep = build_indexes(args.out, args.sandboxes, args.threads, args.only,
+                                args.sjdb_overhang,
+                                {"star": args.min_free_gb_star, "salmon": args.min_free_gb_salmon})
+        except BuilderError as exc:
+            print(f"bj-reference-builder: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(rep, indent=2))
+        return 0
     if args.cmd == "housekeeping":
         try:
             rep = write_housekeeping(args.out, args.genes)
