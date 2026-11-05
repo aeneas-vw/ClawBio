@@ -66,7 +66,7 @@ import csv
 samples = [r["biosampleName"] for r in csv.DictReader(open(params["input_csv"]))]
 files = [
     res + "/multiqc/multiqc_report.html",
-    sa + "/secondary_metrics/pipeline_metrics_summary.csv",
+    sa + "/secondary_metrics/qualimap_stats_mqc.csv",
     sa + "/secondary_metrics/pipeline_metrics_summary_percents.csv",
     sa + "/secondary_metrics/df_dynamicrange_expression.tsv",
     sa + "/quantification_salmon/df_gene_counts_salmon.tsv",
@@ -454,7 +454,10 @@ def test_successful_run_records_status_outputs_and_samples(setup):
     assert r["outputs"]["multiqc_report"].endswith("multiqc_report.html")
     assert r["outputs"]["salmon_gene_counts"].endswith("df_gene_counts_salmon.tsv")
     assert r["outputs"]["htseq_gene_counts"].endswith("df_gene_counts_starhtseq.tsv")
-    assert r["outputs"]["pipeline_metrics_summary"].endswith("pipeline_metrics_summary.csv")
+    assert r["outputs"]["qualimap_stats"].endswith("qualimap_stats_mqc.csv")
+    assert r["outputs"]["pipeline_metrics_summary_percents"].endswith("pipeline_metrics_summary_percents.csv")
+    # BioSkryb's README names pipeline_metrics_summary.csv; 2.0.0 does not write it
+    assert not any("pipeline_metrics_summary.csv" in m for m in r["missing_outputs"])
     assert Path(r["outputs"]["results_dir"]).is_dir()
     assert r["pipeline"]["version"] == PIPELINE_TAG
 

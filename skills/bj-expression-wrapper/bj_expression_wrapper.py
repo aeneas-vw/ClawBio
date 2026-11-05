@@ -61,14 +61,17 @@ DISCLAIMER = (
 
 # Published by workflow/rnaseq.nf under <publish_dir>_<timestamp>/ (required
 # ones must exist for a run to count as a success).
+# Names follow the pipeline's own CODE and tests/main.nf.test, not its README: the
+# README still lists pipeline_metrics_summary.csv, which 2.0.0 does not write
+# (the module CREATE_QC_REPORT emits qualimap_stats_mqc.csv and the _percents file).
 REQUIRED_OUTPUTS = {
     "multiqc_report": "multiqc/multiqc_report.html",
-    "pipeline_metrics_summary": "secondary_analyses/secondary_metrics/pipeline_metrics_summary.csv",
+    "qualimap_stats": "secondary_analyses/secondary_metrics/qualimap_stats_mqc.csv",
+    "pipeline_metrics_summary_percents": "secondary_analyses/secondary_metrics/pipeline_metrics_summary_percents.csv",
     "salmon_gene_counts": "secondary_analyses/quantification_salmon/df_gene_counts_salmon.tsv",
     "htseq_gene_counts": "secondary_analyses/quantification_htseq/df_gene_counts_starhtseq.tsv",
 }
 OPTIONAL_OUTPUTS = {
-    "pipeline_metrics_summary_percents": "secondary_analyses/secondary_metrics/pipeline_metrics_summary_percents.csv",
     "dynamic_range_expression": "secondary_analyses/secondary_metrics/df_dynamicrange_expression.tsv",
 }
 ALIGNMENT_DIR = "secondary_analyses/alignment_htseq"
