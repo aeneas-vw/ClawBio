@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -310,6 +311,20 @@ def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path) -> dic
     return params
 
 
+def new_trace_path(run_dir: Path, now: datetime | None = None) -> Path:
+    """A trace file name that cannot already exist: Nextflow refuses to overwrite one.
+
+    Microseconds in the name, plus a numeric suffix if that name is somehow taken
+    (two invocations in the same instant)."""
+    now = now or datetime.now(timezone.utc)
+    stem = f"trace_{now:%Y%m%dT%H%M%S}.{now.microsecond:06d}Z"
+    path, i = run_dir / f"{stem}.tsv", 1
+    while path.exists():
+        path = run_dir / f"{stem}-{i}.tsv"
+        i += 1
+    return path
+
+
 def build_command(pipeline_dir: str, params_file: Path, work_dir: Path,
                   profile: str, resume: bool,
                   extra_config: Path | None = None,
@@ -389,6 +404,98 @@ def collect_outputs(results_dir: Path, samples: list[str]) -> dict:
 
 
 # ──────────────────────────────────────────────
+# Real files instead of symlinks
+# ──────────────────────────────────────────────
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class _CopyMismatch(Exception):
+    pass
+
+
+def _replace_link_with_file(link: Path, target: Path) -> int:
+    tmp = link.with_name(link.name + ".materialise-tmp")
+    try:
+        shutil.copy2(target, tmp)
+        if _sha256(tmp) != _sha256(target):
+            raise _CopyMismatch(str(link))
+        size = tmp.stat().st_size
+        os.replace(tmp, link)  # atomically swaps the symlink for the real file
+        return size
+    finally:
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+
+
+def _replace_link_with_dir(link: Path, target: Path) -> tuple[int, int]:
+    tmp = link.with_name(link.name + ".materialise-tmp")
+    try:
+        shutil.copytree(target, tmp, symlinks=False)  # follows links inside, too
+        n = size = 0
+        for root, _dirs, files in os.walk(target, followlinks=True):
+            for name in files:
+                src = Path(root) / name
+                dst = tmp / src.relative_to(target)
+                if not dst.is_file() or _sha256(dst) != _sha256(src):
+                    raise _CopyMismatch(str(link))
+                n += 1
+                size += dst.stat().st_size
+        link.unlink()
+        os.rename(tmp, link)
+        return n, size
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def materialise_results(results_dir: Path) -> dict:
+    """Replace every symlink under results_dir with a verified real copy.
+
+    BioSkryb's publishDir directives set no mode, so Nextflow publishes symlinks
+    into work/, and a config override does not change that. Each copy is checked
+    by SHA-256 before it replaces its link; the files in work/ are never modified.
+    Broken links and failed copies are reported, not fatal. Safe to repeat.
+    """
+    results_dir = Path(results_dir)
+    if not results_dir.is_dir():
+        raise WrapperError(f"results directory not found: {results_dir}")
+    report: dict = {"files": 0, "dirs": 0, "bytes": 0, "already_real": 0,
+                    "broken": [], "failed": []}
+    links: list[Path] = []
+    for root, dirs, files in os.walk(results_dir):  # does not descend into links
+        for name in dirs + files:
+            p = Path(root) / name
+            if p.is_symlink():
+                links.append(p)
+            elif p.is_file():
+                report["already_real"] += 1
+    for link in links:
+        rel = link.relative_to(results_dir).as_posix()
+        target = Path(os.path.realpath(link))
+        if not target.exists():
+            report["broken"].append(rel)
+            continue
+        try:
+            if target.is_dir():
+                n, size = _replace_link_with_dir(link, target)
+                report["dirs"] += 1
+                report["files"] += n
+                report["bytes"] += size
+            else:
+                report["bytes"] += _replace_link_with_file(link, target)
+                report["files"] += 1
+        except (_CopyMismatch, OSError):
+            report["failed"].append(rel)
+    return report
+
+
+# ──────────────────────────────────────────────
 # Report and bundle
 # ──────────────────────────────────────────────
 
@@ -428,6 +535,16 @@ def write_report(out_dir: Path, result: dict) -> Path:
     if result.get("missing_outputs"):
         lines += ["**Expected but not produced:** "
                   + ", ".join(f"`{m}`" for m in result["missing_outputs"]), ""]
+    mat = result.get("results_materialised")
+    if mat:
+        lines += [f"**Results are real files:** {mat['files']} files ({mat['bytes'] / 1e6:.1f} MB) "
+                  "were copied out of the work directory into `results_clawbio/`, because Nextflow "
+                  "publishes symlinks. The work directory is no longer needed for the results; it "
+                  "is still needed for `--resume`.", ""]
+        if mat["broken"] or mat["failed"]:
+            lines += [f"> **Warning:** {len(mat['broken'])} broken link(s) and {len(mat['failed'])} "
+                      "copy failure(s) were left as symlinks: "
+                      + ", ".join(f"`{x}`" for x in (mat["broken"] + mat["failed"])[:8]), ""]
     dropped = result.get("samples_missing_from_outputs") or []
     if dropped and status in ("success", "incomplete"):
         lines += [f"> **Warning:** no alignment was published for: {', '.join(dropped)}. "
@@ -552,6 +669,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="Pass -resume to Nextflow")
     p.add_argument("--strict", action="store_true",
                    help="Exit 1 if any task failed and was ignored by the pipeline")
+    p.add_argument("--keep-symlinks", action="store_true",
+                   help="Leave Nextflow's symlinks in results_clawbio/ (default: replace "
+                        "them with verified real copies after a successful run)")
+    p.add_argument("--materialise-only", action="store_true",
+                   help="Do not run anything: replace the symlinks in an existing run's "
+                        "results_clawbio/ (use with --output <that run's folder>)")
     p.add_argument("--nextflow-version", type=_nxf_version,
                    default=DEFAULT_NEXTFLOW_VERSION,
                    help=f"Nextflow release to run (default {DEFAULT_NEXTFLOW_VERSION}; "
@@ -566,6 +689,14 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     if args.output is None:
         raise WrapperError("--output is required")
+    if args.materialise_only:
+        out = args.output.expanduser().resolve()
+        rep = materialise_results(out / f"results_{RUN_TIMESTAMP}")
+        (out / "materialise_report.json").write_text(json.dumps(rep, indent=2) + "\n")
+        print(f"{PROG}: materialised {rep['files']} files ({rep['bytes'] / 1e6:.1f} MB) as real "
+              f"copies; {rep['already_real']} were already real, {len(rep['broken'])} broken, "
+              f"{len(rep['failed'])} failed -> {out / 'materialise_report.json'}")
+        return 1 if rep["broken"] or rep["failed"] else 0
     if args.demo:
         mode = "demo"
     elif args.check:
@@ -620,7 +751,7 @@ def run(args: argparse.Namespace) -> int:
     run_dir = out_dir / "nextflow_run"
     # One trace file per invocation: Nextflow will not overwrite an existing trace
     # file, so a fixed name made a --resume report the PREVIOUS run's trace.
-    trace_path = run_dir / f"trace_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.tsv"
+    trace_path = new_trace_path(run_dir)
     cmd = build_command(pipeline["path"] if pipeline else "<path-to-bj-expression-checkout>",
                         repro / "params.json", out_dir / "work", args.profile, args.resume,
                         kept_config, trace_path)
@@ -635,6 +766,7 @@ def run(args: argparse.Namespace) -> int:
         "pipeline": pipeline,
         "tools": tools,
         "profile": args.profile,
+        "results_materialised": None,
         "nextflow_version_requested": args.nextflow_version,
         "extra_config": str(kept_config) if kept_config else None,
         "params": params,
@@ -649,6 +781,9 @@ def run(args: argparse.Namespace) -> int:
         result["stderr_tail"] = tail
         found = collect_outputs(Path(params["publish_dir"] + "_" + RUN_TIMESTAMP), samples)
         result.update(found)
+        results_dir = Path(params["publish_dir"] + "_" + RUN_TIMESTAMP)
+        if code == 0 and not args.keep_symlinks and results_dir.is_dir():
+            result["results_materialised"] = materialise_results(results_dir)
         trace = parse_trace(trace_path)
         result["trace"] = ({"available": True, "path": str(trace_path), "tasks": trace["tasks"],
                             "retried_tasks": trace["retried_tasks"]} if trace

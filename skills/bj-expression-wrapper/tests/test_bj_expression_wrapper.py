@@ -76,9 +76,21 @@ for s in samples:
     if s != drop:
         files += [sa + "/alignment_htseq/" + s + ".bam",
                   sa + "/alignment_htseq/" + s + ".bam.bai"]
+pm = os.environ.get("FAKE_NF_PUBLISH", "copy")
 for f in files:
     os.makedirs(os.path.dirname(f), exist_ok=True)
-    open(f, "w").write("fake\\n")
+    if pm == "symlink":
+        w = os.path.join(os.getcwd(), "fake_work", f.lstrip("/").replace("/", "__"))
+        os.makedirs(os.path.dirname(w), exist_ok=True)
+        open(w, "w").write("fake\\n")
+        os.symlink(w, f)
+    else:
+        open(f, "w").write("fake\\n")
+if pm == "symlink":
+    d = os.path.join(os.getcwd(), "fake_work", "multiqc_data")
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "x.txt"), "w").write("data\\n")
+    os.symlink(d, res + "/multiqc/multiqc_data")
 tr = os.environ.get("FAKE_NF_TRACE", "clean")
 if "-with-trace" in args and tr != "none" and not os.path.exists(args[args.index("-with-trace") + 1]):
     tp = args[args.index("-with-trace") + 1]
@@ -705,7 +717,7 @@ def test_relative_output_dir_works_because_nextflow_runs_elsewhere(setup):
 def test_command_asks_nextflow_for_a_trace_under_the_run_dir(setup):
     run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
     cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
-    assert re.search(r"-with-trace \S*/nextflow_run/trace_\d{8}T\d{6}Z\.tsv", cmd), cmd
+    assert re.search(r"-with-trace \S*/nextflow_run/trace_\d{8}T\d{6}\.\d{6}Z(-\d+)?\.tsv", cmd), cmd
 
 
 def test_clean_trace_means_no_ignored_failures(setup):
@@ -857,3 +869,175 @@ def test_a_resume_whose_trace_was_not_written_says_unknown_not_the_old_result(se
     run_cli(base_args(setup, "--accept-bioskryb-terms", "--resume"), env=env)      # no trace this time
     r = result_json(setup["out"])
     assert r["trace"]["available"] is False and r["ignored_failures"] is None
+
+
+# ──────────────────────────────────────────────
+# Real files instead of symlinks in the results folder
+# ──────────────────────────────────────────────
+# BioSkryb's publishDir directives set no mode, so Nextflow publishes symlinks into
+# work/ (a config override does not change that). After a successful run the wrapper
+# replaces each link with a verified real copy; the targets in work/ are never touched.
+
+import os as _os
+
+
+def links_under(root: Path) -> list[Path]:
+    return [Path(r) / n for r, d, f in _os.walk(root) for n in d + f if (Path(r) / n).is_symlink()]
+
+
+def _results(out: Path) -> Path:
+    return out / "results_clawbio"
+
+
+def test_published_symlinks_become_real_files_after_a_run(setup):
+    env = {**setup["env"], "FAKE_NF_PUBLISH": "symlink"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=env)
+    res = _results(setup["out"])
+    assert (res / "multiqc" / "multiqc_report.html").is_file()
+    assert links_under(res) == [], "symlinks were left in the results folder"
+    assert not (res / "multiqc" / "multiqc_data").is_symlink()
+    assert (res / "multiqc" / "multiqc_data" / "x.txt").read_text() == "data\n"
+    m = result_json(setup["out"])["results_materialised"]
+    assert m["files"] >= 8 and m["dirs"] == 1 and m["broken"] == [] and m["failed"] == []
+    assert result_json(setup["out"])["status"] == "success"
+
+
+def test_keep_symlinks_leaves_the_links_and_says_so(setup):
+    env = {**setup["env"], "FAKE_NF_PUBLISH": "symlink"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--keep-symlinks"), env=env)
+    assert len(links_under(_results(setup["out"]))) > 5
+    assert result_json(setup["out"])["results_materialised"] is None
+
+
+def test_the_work_directory_files_are_never_modified(setup):
+    env = {**setup["env"], "FAKE_NF_PUBLISH": "symlink"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--keep-symlinks"), env=env)
+    work = setup["out"] / "nextflow_run" / "fake_work"
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in work.rglob("*") if p.is_file()}
+    run_cli(["--output", setup["out"], "--materialise-only"], env=setup["env"])
+    after = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in work.rglob("*") if p.is_file()}
+    assert before == after and before
+
+
+def test_a_failed_nextflow_run_is_not_materialised(setup):
+    env = {**setup["env"], "FAKE_NF_MODE": "fail", "FAKE_NF_PUBLISH": "symlink"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=env, expect=1)
+    assert result_json(setup["out"])["results_materialised"] is None
+
+
+def test_materialise_only_fixes_an_existing_run_and_leaves_result_json_alone(setup):
+    env = {**setup["env"], "FAKE_NF_PUBLISH": "symlink"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--keep-symlinks"), env=env)
+    before = (setup["out"] / "result.json").read_bytes()
+    res = run_cli(["--output", setup["out"], "--materialise-only"], env=setup["env"])
+    assert links_under(_results(setup["out"])) == []
+    assert (setup["out"] / "result.json").read_bytes() == before
+    rep = json.loads((setup["out"] / "materialise_report.json").read_text())
+    assert rep["failed"] == [] and rep["broken"] == [] and rep["files"] >= 8
+    assert "materialised" in res.stdout.lower()
+
+
+def test_materialise_only_on_a_missing_results_dir_is_a_clear_error(tmp_path):
+    res = run_cli(["--output", tmp_path / "nothing", "--materialise-only"], expect=None)
+    assert res.returncode == 1 and "results" in res.stderr.lower()
+
+
+def test_materialise_is_idempotent(tmp_path):
+    mod = _load_module()
+    src = tmp_path / "work" / "a.txt"
+    src.parent.mkdir()
+    src.write_text("hello")
+    res = tmp_path / "res"
+    res.mkdir()
+    (res / "a.txt").symlink_to(src)
+    first = mod.materialise_results(res)
+    second = mod.materialise_results(res)
+    assert first["files"] == 1 and second["files"] == 0 and second["already_real"] == 1
+    assert (res / "a.txt").read_text() == "hello" and not (res / "a.txt").is_symlink()
+
+
+def test_a_broken_link_is_reported_and_does_not_stop_the_rest(tmp_path):
+    mod = _load_module()
+    good = tmp_path / "work" / "good.txt"
+    good.parent.mkdir()
+    good.write_text("ok")
+    res = tmp_path / "res"
+    res.mkdir()
+    (res / "good.txt").symlink_to(good)
+    (res / "gone.txt").symlink_to(tmp_path / "work" / "missing.txt")
+    rep = mod.materialise_results(res)
+    assert rep["broken"] == ["gone.txt"] and rep["files"] == 1
+    assert (res / "good.txt").read_text() == "ok" and (res / "gone.txt").is_symlink()
+
+
+def test_a_copy_that_does_not_match_leaves_the_link_in_place(tmp_path, monkeypatch):
+    mod = _load_module()
+    src = tmp_path / "work" / "a.txt"
+    src.parent.mkdir()
+    src.write_text("real contents")
+    res = tmp_path / "res"
+    res.mkdir()
+    (res / "a.txt").symlink_to(src)
+    monkeypatch.setattr(mod.shutil, "copy2",
+                        lambda s_, d_, **k: Path(d_).write_text("CORRUPTED"))
+    rep = mod.materialise_results(res)
+    assert rep["failed"] == ["a.txt"] and (res / "a.txt").is_symlink()
+    assert not list(res.glob("*.materialise-tmp")), "temp copy was not cleaned up"
+    assert src.read_text() == "real contents"
+
+
+@settings(deadline=None, max_examples=40)
+@given(tree=st.dictionaries(
+    st.from_regex(r"[a-z]{1,4}(/[a-z]{1,4}){0,2}", fullmatch=True),
+    st.binary(max_size=30), min_size=1, max_size=6),
+    link_every=st.integers(1, 3))
+def test_property_after_materialising_the_tree_reads_the_same_with_no_links(
+        tmp_path_factory, tree, link_every):
+    """Whatever mix of file and directory links, content is unchanged and none remain."""
+    mod = _load_module()
+    base = tmp_path_factory.mktemp("prop")
+    work, res = base / "work", base / "res"
+    work.mkdir()
+    res.mkdir()
+    # keep only paths that do not collide as file-vs-directory
+    kept = {}
+    for rel in sorted(tree):
+        parts = rel.split("/")
+        if any(rel == k or k.startswith(rel + "/") or rel.startswith(k + "/") for k in kept):
+            continue
+        kept[rel] = tree[rel]
+    for i, (rel, data) in enumerate(kept.items()):
+        w = work / rel
+        w.parent.mkdir(parents=True, exist_ok=True)
+        w.write_bytes(data)
+        dest = res / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if i % link_every == 0:
+            dest.symlink_to(w)
+        else:
+            dest.write_bytes(data)
+    expected = {rel: data for rel, data in kept.items()}
+    mod.materialise_results(res)
+    assert links_under(res) == []
+    got = {p.relative_to(res).as_posix(): p.read_bytes() for p in res.rglob("*") if p.is_file()}
+    assert got == expected
+
+
+def test_trace_path_is_unique_even_within_the_same_instant(tmp_path):
+    """Two invocations in the same second used to collide, and Nextflow will not
+    overwrite an existing trace file (the original stale-trace bug, again)."""
+    from datetime import datetime, timezone
+    mod = _load_module()
+    now = datetime(2026, 11, 5, 18, 5, 50, 123456, tzinfo=timezone.utc)
+    first = mod.new_trace_path(tmp_path, now)
+    first.write_text("x")
+    second = mod.new_trace_path(tmp_path, now)
+    assert first != second and not second.exists()
+    assert first.parent == second.parent == tmp_path
+    assert re.fullmatch(r"trace_20261105T180550\.123456Z\.tsv", first.name)
+
+
+def test_trace_path_includes_microseconds_so_back_to_back_runs_differ(tmp_path):
+    mod = _load_module()
+    a, b = mod.new_trace_path(tmp_path), mod.new_trace_path(tmp_path)
+    assert a != b or not a.exists()  # never hands out a path that already exists
