@@ -2582,7 +2582,7 @@ def main():
         if args.skill == "scrnaseq-pipeline" and _is_scrnaseq_backend_profile(getattr(args, "profile_path", None)):
             skill_backend_profile = args.profile_path
             args.profile_path = None
-        elif args.skill in {"rnaseq-pipeline", "sarek-pipeline"} and getattr(args, "profile_path", None) is not None:
+        elif args.skill in {"rnaseq-pipeline", "sarek-pipeline", "bj-expression"} and getattr(args, "profile_path", None) is not None:
             skill_backend_profile = args.profile_path
             args.profile_path = None
 

@@ -783,3 +783,44 @@ def test_property_a_task_is_ignored_iff_its_last_state_failed(tmp_path_factory, 
     expect = sorted(n for n, s_ in seqs.items() if s_[-1] in ("FAILED", "ABORTED"))
     assert t["ignored_failures"] == expect
     assert t["tasks"] == len(seqs)
+
+
+# ──────────────────────────────────────────────
+# Through the real ClawBio runner (python clawbio.py run bj-expression ...)
+# ──────────────────────────────────────────────
+# The runner has its own `--profile` (a patient-profile path) and only hands it
+# to a few pipeline skills. Without special handling, `--profile singularity`
+# is swallowed and the wrapper silently falls back to Docker.
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def run_via_runner(args, env):
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "clawbio.py"), "run", "bj-expression",
+         *map(str, args)],
+        capture_output=True, text=True, env=env, cwd=REPO_ROOT)
+
+
+def test_runner_forwards_profile_and_every_wrapper_flag(tmp_path):
+    fq = make_fastqs(tmp_path)
+    sheet = write_csv(tmp_path / "in.csv", [("s1", *fq["s1"])])
+    env = make_tools(tmp_path, docker=False, singularity=True)  # no docker: needs the profile
+    cfg = tmp_path / "x.config"
+    cfg.write_text("// extra\n")
+    out = tmp_path / "out"
+    res = run_via_runner(
+        ["--input", sheet, "--output", out, "--check", "--profile", "singularity",
+         "--pipeline-dir", make_pipeline(tmp_path), "--genomes-base", tmp_path / "refs",
+         "--extra-config", cfg, "--max-cpus", "8", "--max-memory", "60.GB",
+         "--nextflow-version", "24.10.5", "--accept-bioskryb-terms"], env)
+    assert (out / "result.json").exists(), res.stdout + res.stderr
+    r = result_json(out)
+    assert r["status"] == "check_passed"
+    assert r["profile"] == "singularity", "the runner swallowed --profile"
+    assert r["terms_accepted"] is True
+    assert r["nextflow_version_requested"] == "24.10.5"
+    assert r["extra_config"].endswith("extra.config")
+    p = json.loads((out / "reproducibility" / "params.json").read_text())
+    assert p["max_cpus"] == 8 and p["max_memory"] == "60.GB"
+    assert p["genomes_base"] == str(tmp_path / "refs")
