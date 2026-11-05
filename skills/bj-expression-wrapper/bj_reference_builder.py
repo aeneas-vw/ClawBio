@@ -325,6 +325,68 @@ def write_housekeeping(out: Path, genes_file: Path) -> dict:
 
 
 # ──────────────────────────────────────────────
+# Cell-typing reference (celltype_ref)
+# ──────────────────────────────────────────────
+
+CELLTYPE_DIR = Path("dev-resources/rnaseq_celltype_qbio")
+CELLTYPE_NAME = "db_celltype_qbio.RDS"  # the script runs readRDS() on exactly this name
+# scrnaseq_celltype_refactored_pipeline.R indexes the list by these fixed names;
+# a list without them makes that step fail (the pipeline then ignores the failure).
+CELLTYPE_EXPECTED = ("HPCA_singleR", "GTEx_singleR", "GTExmeds_singleR",
+                     "TCGA_STN_singleR", "TCGA_PT_singleR")
+CELLTYPE_IMAGE = "public.ecr.aws/v2u5x5f1/basejumper:rnaseq_celltype_0.4"
+
+
+def missing_celltype_entries(names) -> list[str]:
+    have = set(names)
+    return [n for n in CELLTYPE_EXPECTED if n not in have]
+
+
+def inspect_celltype_names(apptainer: str, sandbox: Path, rds: Path,
+                           bind: Path | None = None) -> list[str] | None:
+    """Entry names of the list in the RDS, read inside the cell-typing image
+    (it has R). None if it could not be read."""
+    import subprocess
+    bind = Path(bind) if bind else Path.home()
+    r = ('x <- readRDS(commandArgs(TRUE)[1]); '
+         'cat(if (is.list(x)) names(x) else character(0), sep = "\\n")')
+    try:
+        proc = subprocess.run(
+            [apptainer, "exec", "--writable", "--bind", f"{bind}:{bind}", str(sandbox),
+             "Rscript", "-e", r, str(rds)], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def place_celltype_ref(out: Path, rds: Path, force: bool = False,
+                       names: list[str] | None = None) -> dict:
+    """Copy an RDS to where the pipeline will look for it, under the name its
+    script reads. A copy (not a link) so containers that cannot see the source
+    path, such as /orgbucket, still find it."""
+    rds, out = Path(rds), Path(out)
+    if not rds.is_file():
+        raise BuilderError(f"cell-typing RDS not found: {rds}")
+    dest = out / CELLTYPE_DIR / CELLTYPE_NAME
+    digest = hashlib.sha256(rds.read_bytes()).hexdigest()
+    if dest.exists():
+        if hashlib.sha256(dest.read_bytes()).hexdigest() != digest and not force:
+            raise BuilderError(f"{dest} already holds a different file; pass --force to replace it")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(rds, dest)
+    missing = missing_celltype_entries(names) if names is not None else None
+    return {
+        "source": str(rds), "placed": str(dest), "sha256": digest,
+        "inspected": names is not None,
+        "entries_found": list(names) if names is not None else None,
+        "expected_entries_missing": missing,
+        "compatible_with_pipeline_script": (not missing) if names is not None else None,
+    }
+
+
+# ──────────────────────────────────────────────
 # build-indexes: STAR and Salmon inside the sandboxes, with a RAM guard
 # ──────────────────────────────────────────────
 
@@ -512,6 +574,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True, help="Root to pass as --genomes-base")
     p.add_argument("--versions", choices=("auto", "yes", "no"), default="auto",
                    help="Put .version on transcript/gene IDs (auto = follow the Ensembl FASTA)")
+    c = sub.add_parser("celltype", help="Wire an RDS in as the pipeline's cell-typing reference")
+    c.add_argument("--rds", type=Path, required=True)
+    c.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
+    c.add_argument("--sandboxes", type=Path, default=Path.home() / "bj-expression-sandboxes")
+    c.add_argument("--force", action="store_true", help="Replace a different file already there")
+    c.add_argument("--no-inspect", action="store_true",
+                   help="Do not read the list's entry names in the container")
     b = sub.add_parser("build-indexes", help="Build the STAR and Salmon indexes in the sandboxes (needs lots of RAM)")
     b.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
     b.add_argument("--sandboxes", type=Path, default=Path.home() / "bj-expression-sandboxes")
@@ -525,6 +594,32 @@ def main(argv: list[str] | None = None) -> int:
                    help="Two columns: Ensembl gene ID (version optional), symbol")
     h.add_argument("--out", type=Path, required=True, help="The root 'prepare' wrote")
     args = ap.parse_args(argv)
+    if args.cmd == "celltype":
+        try:
+            rep = place_celltype_ref(args.out, args.rds, args.force)
+            if not args.no_inspect:
+                exe = shutil.which("apptainer") or shutil.which("singularity")
+                box = args.sandboxes / _cache_name(CELLTYPE_IMAGE)
+                if exe and box.is_dir():
+                    # inspect the placed copy: the source may be on a mount the container cannot see
+                    names = inspect_celltype_names(exe, box, Path(rep["placed"]))
+                    if names is not None:
+                        rep = place_celltype_ref(args.out, args.rds, args.force, names)
+        except BuilderError as exc:
+            print(f"bj-reference-builder: error: {exc}", file=sys.stderr)
+            return 1
+        (args.out / "celltype_report.json").write_text(json.dumps(rep, indent=2) + "\n")
+        print(f"Placed: {rep['placed']}")
+        if not rep["inspected"]:
+            print("Entry names were not inspected, so compatibility with the pipeline's "
+                  "cell-typing script is unknown.")
+        elif rep["compatible_with_pipeline_script"]:
+            print("All five entries the pipeline's script needs are present.")
+        else:
+            print("WARNING: the pipeline's cell-typing script needs these entries, which are "
+                  f"missing: {', '.join(rep['expected_entries_missing'])}. That step will fail "
+                  "and the pipeline will ignore the failure after two retries.")
+        return 0
     if args.cmd == "build-indexes":
         try:
             rep = build_indexes(args.out, args.sandboxes, args.threads, args.only,

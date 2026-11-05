@@ -152,7 +152,7 @@ What it writes, and why each format is what it is (all read from the pipeline's 
 | Salmon input | Ensembl 104 cDNA + ncRNA, filtered to transcripts present in tx2gene, plus the genome as decoys | Every Salmon transcript must be in tx2gene |
 | `star_index`, Salmon index | `build-indexes` runs STAR 2.7.6a and Salmon 1.6.0 (the pipeline's versions) inside the sandboxes | Needs a lot of RAM: it refuses to start below a free-memory floor (conservative estimates, not measurements: STAR 40 GiB, Salmon 16 GiB; override with `--min-free-gb-star/-salmon`) |
 | `genebody_ref` | `housekeeping --genes FILE`: 12-column BED of every transcript of the listed genes | List is two columns (Ensembl gene ID, symbol); matched on the unversioned ID because list and GTF versions differ; misses and symbol disagreements go to `housekeeping_report.json` |
-| cell-typing RDS | Not built here: place BioSkryb's `db_celltype_qbio.RDS` at `<root>/dev-resources/rnaseq_celltype_qbio/` | See Gotchas |
+| cell-typing RDS | `celltype --rds FILE` copies it to `<root>/dev-resources/rnaseq_celltype_qbio/db_celltype_qbio.RDS` (the script runs `readRDS` on exactly that name; a copy, so containers that cannot see the source mount still find it) and reads its entry names in the container | The script needs five named entries; `celltype_report.json` says which are missing. A list without them is wired in but that step fails and is ignored (see Gotchas) |
 
 After `prepare` and `housekeeping`, build the indexes (once the machine has the RAM), then point runs at the root:
 

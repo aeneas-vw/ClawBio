@@ -595,3 +595,120 @@ def test_missing_sandbox_names_the_image_and_the_fix(tmp_path, monkeypatch):
     _sh.rmtree(sb / "quay.io-biocontainers-star-2.7.6a--0.img")
     with pytest.raises(mod.BuilderError, match="apptainer_sandboxes"):
         mod.build_indexes(out, sb, threads=4, meminfo_text=MEM_OK)
+
+
+# ──────────────────────────────────────────────
+# Cell-typing reference (celltype_ref)
+# ──────────────────────────────────────────────
+# The pipeline's script runs readRDS("db_celltype_qbio.RDS") on the staged file,
+# so whatever is wired in must be named exactly that, at
+# <genomes_base>/dev-resources/rnaseq_celltype_qbio/. It also indexes the list by
+# five fixed entry names, so other lists "work" only until that step fails.
+
+def test_the_five_entry_names_the_script_hardcodes():
+    mod = load()
+    assert mod.CELLTYPE_EXPECTED == ("HPCA_singleR", "GTEx_singleR", "GTExmeds_singleR",
+                                     "TCGA_STN_singleR", "TCGA_PT_singleR")
+
+
+@settings(deadline=None, max_examples=60)
+@given(names=st.lists(st.sampled_from(["HPCA_singleR", "GTEx_singleR", "GTExmeds_singleR",
+                                       "TCGA_STN_singleR", "TCGA_PT_singleR", "HPCA", "other"]),
+                      max_size=7))
+def test_property_missing_entries_are_exactly_the_expected_ones_not_present(names):
+    mod = load()
+    missing = mod.missing_celltype_entries(names)
+    assert set(missing) == set(mod.CELLTYPE_EXPECTED) - set(names)
+    assert list(missing) == [n for n in mod.CELLTYPE_EXPECTED if n in missing], "stable order"
+
+
+def test_celltype_ref_is_copied_under_the_exact_name_the_script_reads(tmp_path):
+    mod = load()
+    src = tmp_path / "celldex_HPCA_plus_GTEx.rds"
+    src.write_bytes(b"rds-bytes")
+    rep = mod.place_celltype_ref(tmp_path / "refs", src,
+                                 names=["HPCA", "GTEx_v9_tissue_aggregate_min10"])
+    dest = tmp_path / "refs/dev-resources/rnaseq_celltype_qbio/db_celltype_qbio.RDS"
+    assert dest.read_bytes() == b"rds-bytes" and not dest.is_symlink()
+    assert rep["sha256"] == __import__("hashlib").sha256(b"rds-bytes").hexdigest()
+    assert rep["source"] == str(src) and rep["placed"] == str(dest)
+    assert rep["compatible_with_pipeline_script"] is False
+    assert rep["expected_entries_missing"] == list(mod.CELLTYPE_EXPECTED)
+
+
+def test_a_list_with_all_five_entries_is_reported_compatible(tmp_path):
+    mod = load()
+    src = tmp_path / "x.rds"
+    src.write_bytes(b"1")
+    rep = mod.place_celltype_ref(tmp_path / "refs", src, names=list(mod.CELLTYPE_EXPECTED))
+    assert rep["compatible_with_pipeline_script"] is True and rep["expected_entries_missing"] == []
+
+
+def test_unknown_entry_names_are_reported_as_unchecked_not_compatible(tmp_path):
+    mod = load()
+    src = tmp_path / "x.rds"
+    src.write_bytes(b"1")
+    rep = mod.place_celltype_ref(tmp_path / "refs", src, names=None)
+    assert rep["compatible_with_pipeline_script"] is None and rep["inspected"] is False
+
+
+def test_a_different_existing_file_is_not_overwritten_without_force(tmp_path):
+    mod = load()
+    a, b = tmp_path / "a.rds", tmp_path / "b.rds"
+    a.write_bytes(b"AAA")
+    b.write_bytes(b"BBB")
+    mod.place_celltype_ref(tmp_path / "refs", a)
+    mod.place_celltype_ref(tmp_path / "refs", a)  # same content: fine, idempotent
+    with pytest.raises(mod.BuilderError, match="force"):
+        mod.place_celltype_ref(tmp_path / "refs", b)
+    dest = tmp_path / "refs/dev-resources/rnaseq_celltype_qbio/db_celltype_qbio.RDS"
+    assert dest.read_bytes() == b"AAA"
+    mod.place_celltype_ref(tmp_path / "refs", b, force=True)
+    assert dest.read_bytes() == b"BBB"
+
+
+def test_missing_celltype_source_is_named(tmp_path):
+    mod = load()
+    with pytest.raises(mod.BuilderError, match="nope.rds"):
+        mod.place_celltype_ref(tmp_path / "refs", tmp_path / "nope.rds")
+
+
+def test_celltype_command_writes_a_report_and_says_when_it_could_not_inspect(tmp_path, capsys, monkeypatch):
+    mod = load()
+    monkeypatch.setenv("PATH", str(tmp_path))  # no apptainer: inspection must be skipped, not crash
+    src = tmp_path / "x.rds"
+    src.write_bytes(b"1")
+    code = mod.main(["celltype", "--rds", str(src), "--out", str(tmp_path / "refs")])
+    assert code == 0
+    rep = json.loads((tmp_path / "refs" / "celltype_report.json").read_text())
+    assert rep["inspected"] is False and rep["compatible_with_pipeline_script"] is None
+    assert "not inspected" in capsys.readouterr().out.lower()
+
+
+def test_celltype_command_inspects_the_placed_copy_not_the_source(tmp_path, monkeypatch, capsys):
+    """The source may be on a mount the container cannot see (/orgbucket); the
+    copy under the references root is the one the container can read."""
+    mod = load()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "inspect.log"
+    exe = bindir / "apptainer"
+    exe.write_text(f"#!{sys.executable}\nimport sys\nopen({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                   "print('HPCA'); print('GTEx_v9_tissue_aggregate_min10')\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    sandboxes = tmp_path / "sandboxes"
+    (sandboxes / mod._cache_name(mod.CELLTYPE_IMAGE)).mkdir(parents=True)
+    src = tmp_path / "elsewhere" / "ref.rds"
+    src.parent.mkdir()
+    src.write_bytes(b"1")
+    code = mod.main(["celltype", "--rds", str(src), "--out", str(tmp_path / "refs"),
+                     "--sandboxes", str(sandboxes)])
+    assert code == 0
+    called = log.read_text()
+    placed = str(tmp_path / "refs/dev-resources/rnaseq_celltype_qbio/db_celltype_qbio.RDS")
+    assert placed in called and str(src) not in called
+    rep = json.loads((tmp_path / "refs" / "celltype_report.json").read_text())
+    assert rep["inspected"] is True and rep["compatible_with_pipeline_script"] is False
+    assert rep["entries_found"] == ["HPCA", "GTEx_v9_tissue_aggregate_min10"]
+    assert "WARNING" in capsys.readouterr().out
