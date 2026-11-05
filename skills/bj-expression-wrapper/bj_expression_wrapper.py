@@ -445,7 +445,7 @@ def write_report(out_dir: Path, result: dict) -> Path:
                   "run continues and can exit 0. These tasks did not finish:", ""]
         lines += [f"- `{t}`" for t in ignored_tasks]
         lines += ["", "Anything downstream of them may be missing or partial. Check "
-                  "`nextflow_run/trace.tsv` and the task work directories.", ""]
+                  "the trace file named in `result.json` (`trace.path`) and the task work directories.", ""]
     elif ignored_tasks is None and status in ("success", "success_with_ignored_failures",
                                               "incomplete"):
         lines += ["> **No Nextflow trace was available**, so ignored task failures could "
@@ -618,9 +618,12 @@ def run(args: argparse.Namespace) -> int:
     (repro / "params.json").write_text(json.dumps(params, indent=2) + "\n")
 
     run_dir = out_dir / "nextflow_run"
+    # One trace file per invocation: Nextflow will not overwrite an existing trace
+    # file, so a fixed name made a --resume report the PREVIOUS run's trace.
+    trace_path = run_dir / f"trace_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.tsv"
     cmd = build_command(pipeline["path"] if pipeline else "<path-to-bj-expression-checkout>",
                         repro / "params.json", out_dir / "work", args.profile, args.resume,
-                        kept_config, run_dir / "trace.tsv")
+                        kept_config, trace_path)
     pin = "" if args.nextflow_version == "system" else f"NXF_VER={args.nextflow_version} "
     command_text = f"cd {shlex.quote(str(run_dir))} && {pin}{shlex.join(cmd)}"
 
@@ -646,10 +649,11 @@ def run(args: argparse.Namespace) -> int:
         result["stderr_tail"] = tail
         found = collect_outputs(Path(params["publish_dir"] + "_" + RUN_TIMESTAMP), samples)
         result.update(found)
-        trace = parse_trace(run_dir / "trace.tsv")
-        result["trace"] = ({"available": True, "tasks": trace["tasks"],
+        trace = parse_trace(trace_path)
+        result["trace"] = ({"available": True, "path": str(trace_path), "tasks": trace["tasks"],
                             "retried_tasks": trace["retried_tasks"]} if trace
-                           else {"available": False, "tasks": 0, "retried_tasks": []})
+                           else {"available": False, "path": str(trace_path), "tasks": 0,
+                                 "retried_tasks": []})
         result["ignored_failures"] = trace["ignored_failures"] if trace else None
         if code != 0:
             result["status"], exit_code = "failed", 1

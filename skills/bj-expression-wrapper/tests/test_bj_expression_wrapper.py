@@ -80,7 +80,7 @@ for f in files:
     os.makedirs(os.path.dirname(f), exist_ok=True)
     open(f, "w").write("fake\\n")
 tr = os.environ.get("FAKE_NF_TRACE", "clean")
-if "-with-trace" in args and tr != "none":
+if "-with-trace" in args and tr != "none" and not os.path.exists(args[args.index("-with-trace") + 1]):
     tp = args[args.index("-with-trace") + 1]
     rows = ["1\\tab\\t-\\tRNASEQ_WF:STARALIGN (s1)\\tCOMPLETED\\t0"]
     if tr == "ignored":
@@ -705,7 +705,7 @@ def test_relative_output_dir_works_because_nextflow_runs_elsewhere(setup):
 def test_command_asks_nextflow_for_a_trace_under_the_run_dir(setup):
     run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
     cmd = (setup["out"] / "reproducibility" / "commands.sh").read_text()
-    assert f"-with-trace {setup['out'] / 'nextflow_run' / 'trace.tsv'}" in cmd
+    assert re.search(r"-with-trace \S*/nextflow_run/trace_\d{8}T\d{6}Z\.tsv", cmd), cmd
 
 
 def test_clean_trace_means_no_ignored_failures(setup):
@@ -827,3 +827,33 @@ def test_runner_forwards_profile_and_every_wrapper_flag(tmp_path):
     p = json.loads((out / "reproducibility" / "params.json").read_text())
     assert p["max_cpus"] == 8 and p["max_memory"] == "60.GB"
     assert p["genomes_base"] == str(tmp_path / "refs")
+
+
+def test_a_resumed_run_reports_its_own_trace_not_the_previous_runs(setup):
+    """Real Nextflow refuses to overwrite an existing trace file, so a fixed trace
+    name made a resume report the FIRST run's failures (and miss its own)."""
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])        # clean first run
+    assert result_json(setup["out"])["ignored_failures"] == []
+    env = {**setup["env"], "FAKE_NF_TRACE": "ignored"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--resume"), env=env)      # resume with a failure
+    r = result_json(setup["out"])
+    assert r["status"] == "success_with_ignored_failures"
+    assert r["ignored_failures"] == ["RNASEQ_WF:CELL_TYPING (CELL_TYPING)"]
+
+
+def test_each_invocation_gets_its_own_trace_file_and_records_the_path(setup):
+    import time
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
+    first = result_json(setup["out"])["trace"]["path"]
+    time.sleep(1.1)  # the file name carries a one-second timestamp
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--resume"), env=setup["env"])
+    second = result_json(setup["out"])["trace"]["path"]
+    assert first != second and Path(first).exists() and Path(second).exists()
+
+
+def test_a_resume_whose_trace_was_not_written_says_unknown_not_the_old_result(setup):
+    run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])        # trace written, clean
+    env = {**setup["env"], "FAKE_NF_TRACE": "none"}
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--resume"), env=env)      # no trace this time
+    r = result_json(setup["out"])
+    assert r["trace"]["available"] is False and r["ignored_failures"] is None
