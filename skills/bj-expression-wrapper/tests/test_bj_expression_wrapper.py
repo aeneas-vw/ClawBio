@@ -161,8 +161,8 @@ def make_fastqs(tmp_path: Path, names=("s1", "s2")) -> dict:
     out = {}
     for n in names:
         r1, r2 = d / f"{n}_R1_001.fastq.gz", d / f"{n}_R2_001.fastq.gz"
-        r1.write_bytes(b"x")
-        r2.write_bytes(b"x")
+        gz_fastq(r1, 10, 1)
+        gz_fastq(r2, 10, 2)
         out[n] = (r1, r2)
     return out
 
@@ -203,8 +203,10 @@ def setup(tmp_path):
 
 
 def base_args(s, *extra):
+    choice = [] if any(a in extra for a in ("--reads-per-file", "--skip-subsampling")) \
+        else ["--reads-per-file", "5"]
     return ["--input", s["csv"], "--output", s["out"],
-            "--pipeline-dir", s["pipeline"], *extra]
+            "--pipeline-dir", s["pipeline"], *choice, *extra]
 
 
 def result_json(out: Path) -> dict:
@@ -345,27 +347,29 @@ def test_property_accepted_sample_names_are_path_and_shell_safe(name):
 def test_params_only_carry_required_values_and_explicit_overrides(setup):
     run_cli(base_args(setup, "--accept-bioskryb-terms"), env=setup["env"])
     params = json.loads((setup["out"] / "reproducibility" / "params.json").read_text())
-    assert set(params) == {"input_csv", "publish_dir", "timestamp", "genome"}
+    assert set(params) == {"input_csv", "publish_dir", "timestamp", "genome", "n_reads"}
     assert params["genome"] == "GRCh38"
-    for k in ("n_reads", "read_length", "min_reads", "seqtk_sample_seed"):
+    assert params["n_reads"] == 10, "--reads-per-file 5 x 2: the pipeline counts R1+R2 together"
+    for k in ("read_length", "min_reads", "seqtk_sample_seed"):
         assert k not in params, f"{k} would silently override the pipeline default"
 
 
 def test_explicit_overrides_are_passed_through(setup):
-    run_cli(base_args(setup, "--accept-bioskryb-terms", "--n-reads", "5000",
-                      "--read-length", "75", "--min-reads", "100", "--seed", "7",
+    run_cli(base_args(setup, "--accept-bioskryb-terms", "--reads-per-file", "8",
+                      "--read-length", "75", "--min-reads", "100", "--seed", "123",
                       "--skip-cutadapt", "--genome", "GRCm39",
                       "--max-cpus", "8", "--max-memory", "50.GB"),
             env=setup["env"])
     p = json.loads((setup["out"] / "reproducibility" / "params.json").read_text())
-    assert p["n_reads"] == 5000 and p["read_length"] == 75
-    assert p["min_reads"] == 100 and p["seqtk_sample_seed"] == 7
+    assert p["n_reads"] == 16 and p["read_length"] == 75
+    assert p["min_reads"] == 100 and p["seqtk_sample_seed"] == 123
     assert p["skip_cutadapt"] is True and p["genome"] == "GRCm39"
     assert p["max_cpus"] == 8 and p["max_memory"] == "50.GB"
 
 
 @pytest.mark.parametrize("bad", [
-    ["--n-reads", "0"], ["--n-reads", "-1"], ["--read-length", "0"],
+    ["--reads-per-file", "0"], ["--reads-per-file", "-3"], ["--reads-per-file", "lots"],
+    ["--n-reads", "0"], ["--read-length", "0"],
     ["--min-reads", "-1"], ["--genome", "hg19"], ["--max-cpus", "0"],
     ["--max-memory", "lots"], ["--profile", "podman"],
 ])
@@ -406,7 +410,7 @@ def test_singularity_profile_and_resume_are_forwarded(tmp_path):
 
 def test_missing_pipeline_dir_explains_how_to_get_it_and_the_licence(setup):
     res = run_cli(["--input", setup["csv"], "--output", setup["out"],
-                   "--pipeline-dir", setup["tmp"] / "nowhere",
+                   "--pipeline-dir", setup["tmp"] / "nowhere", "--reads-per-file", "5",
                    "--accept-bioskryb-terms"], env=setup["env"], expect=None)
     assert res.returncode != 0
     assert "git clone" in res.stderr and LICENSE_URL in res.stderr
@@ -702,7 +706,7 @@ def test_no_extra_config_means_no_dash_c(setup):
 def test_relative_output_dir_works_because_nextflow_runs_elsewhere(setup):
     """Nextflow runs in <output>/nextflow_run, so every path handed to it must
     be absolute or a relative --output would lose its own params file."""
-    res = run_cli(["--input", setup["csv"], "--output", "rel_out",
+    res = run_cli(["--input", setup["csv"], "--output", "rel_out", "--reads-per-file", "5",
                    "--pipeline-dir", setup["pipeline"], "--accept-bioskryb-terms"],
                   env=setup["env"], cwd=setup["tmp"])
     r = json.loads((setup["tmp"] / "rel_out" / "result.json").read_text())
@@ -828,7 +832,7 @@ def test_runner_forwards_profile_and_every_wrapper_flag(tmp_path):
         ["--input", sheet, "--output", out, "--check", "--profile", "singularity",
          "--pipeline-dir", make_pipeline(tmp_path), "--genomes-base", tmp_path / "refs",
          "--extra-config", cfg, "--max-cpus", "8", "--max-memory", "60.GB",
-         "--nextflow-version", "24.10.5", "--accept-bioskryb-terms"], env)
+         "--nextflow-version", "24.10.5", "--accept-bioskryb-terms", "--reads-per-file", "5"], env)
     assert (out / "result.json").exists(), res.stdout + res.stderr
     r = result_json(out)
     assert r["status"] == "check_passed"
@@ -1041,3 +1045,187 @@ def test_trace_path_includes_microseconds_so_back_to_back_runs_differ(tmp_path):
     mod = _load_module()
     a, b = mod.new_trace_path(tmp_path), mod.new_trace_path(tmp_path)
     assert a != b or not a.exists()  # never hands out a path that already exists
+
+
+# ──────────────────────────────────────────────
+# Reads per file: counted up front, chosen explicitly, translated to the pipeline's units
+# ──────────────────────────────────────────────
+# bj-expression's SEQTK_SAMPLE divides n_reads by the reads of R1 AND R2 together, so the
+# default n_reads = 100000 gave ~50,000 reads PER FILE. It only trims to read_length when it
+# actually samples (otherwise it copies the files), and it hard-codes -s123 for read 2, so a
+# different seed would desynchronise the mates. The wrapper therefore counts reads first,
+# requires an explicit per-file choice, and refuses any seed but 123.
+
+import gzip as _gzip
+
+
+def gz_fastq(path: Path, n: int, mate: int = 1) -> Path:
+    text = "".join(f"@r{i}/{mate}\nACGTACGTAC\n+\nIIIIIIIIII\n" for i in range(n))
+    with _gzip.open(path, "wt") as fh:
+        fh.write(text)
+    return path
+
+
+def counted_setup(tmp_path, counts):
+    """counts = {sample: (r1_reads, r2_reads)} -> sheet + working fakes, like `setup`."""
+    d = tmp_path / "cfq"
+    d.mkdir()
+    rows = []
+    for name, (n1, n2) in counts.items():
+        r1 = gz_fastq(d / f"{name}_R1.fastq.gz", n1, 1)
+        r2 = gz_fastq(d / f"{name}_R2.fastq.gz", n2, 2)
+        rows.append((name, r1, r2))
+    return {"tmp": tmp_path, "csv": write_csv(tmp_path / "c.csv", rows),
+            "pipeline": make_pipeline(tmp_path), "env": make_tools(tmp_path),
+            "out": tmp_path / "out"}
+
+
+def test_count_fastq_reads_on_gz_and_plain_files(tmp_path):
+    mod = _load_module()
+    assert mod.count_fastq_reads(gz_fastq(tmp_path / "a.fastq.gz", 7)) == 7
+    plain = tmp_path / "b.fastq"
+    plain.write_text("@r\nAC\n+\nII\n" * 3)
+    assert mod.count_fastq_reads(plain) == 3
+    assert mod.count_fastq_reads(gz_fastq(tmp_path / "empty.fastq.gz", 0)) == 0
+
+
+def test_count_fastq_reads_rejects_files_that_are_not_fastq(tmp_path):
+    mod = _load_module()
+    bad = tmp_path / "bad.fastq.gz"
+    bad.write_bytes(b"not gzip at all")
+    with pytest.raises(mod.WrapperError, match="bad.fastq.gz"):
+        mod.count_fastq_reads(bad)
+    trunc = tmp_path / "trunc.fastq"
+    trunc.write_text("@r\nAC\n+\n")  # 3 lines: not a multiple of 4
+    with pytest.raises(mod.WrapperError, match="trunc.fastq"):
+        mod.count_fastq_reads(trunc)
+
+
+@settings(deadline=None, max_examples=40)
+@given(n=st.integers(0, 60), gz=st.booleans(), final_newline=st.booleans())
+def test_property_read_count_matches_the_records_written(tmp_path_factory, n, gz, final_newline):
+    mod = _load_module()
+    d = tmp_path_factory.mktemp("cnt")
+    text = "".join(f"@r{i}\nACGT\n+\nIIII" + ("\n" if (i < n - 1 or final_newline) else "") for i in range(n))
+    p = d / ("x.fastq.gz" if gz else "x.fastq")
+    (_gzip.open(p, "wt") if gz else open(p, "w")).write(text)
+    assert mod.count_fastq_reads(p) == n
+
+
+def test_count_reads_mode_prints_the_table_and_runs_nothing(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (100, 100), "s2": (250, 250)})
+    res = run_cli(["--input", s["csv"], "--count-reads"], env=s["env"])
+    assert "s1" in res.stdout and "100" in res.stdout and "s2" in res.stdout and "250" in res.stdout
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("mode", [[], ["--check"]])
+def test_a_run_without_a_read_choice_stops_and_shows_what_is_available(tmp_path, mode):
+    s = counted_setup(tmp_path, {"s1": (120, 120), "s2": (80, 80)})
+    # built by hand: base_args() would add a default read choice and defeat the point
+    args = ["--input", s["csv"], "--output", s["out"], "--pipeline-dir", s["pipeline"],
+            "--accept-bioskryb-terms", *mode]
+    res = run_cli(args, env=s["env"], expect=None)
+    assert res.returncode == 1
+    assert "--reads-per-file" in res.stderr and "all" in res.stderr
+    assert "s1" in res.stderr and "120" in res.stderr and "80" in res.stderr
+    assert not (s["out"] / "result.json").exists()
+
+
+def test_the_demo_does_not_need_a_read_choice(tmp_path):
+    run_cli(["--demo", "--output", tmp_path / "d"], env={"PATH": str(tmp_path)})
+
+
+def test_reads_per_file_is_translated_to_the_pipelines_combined_count(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (100, 100), "s2": (100, 100)})
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "40"), env=s["env"])
+    p = json.loads((s["out"] / "reproducibility" / "params.json").read_text())
+    assert p["n_reads"] == 80, "the pipeline divides n_reads by R1+R2 together, so per-file x 2"
+    assert "skip_subsampling" not in p
+    sub = result_json(s["out"])["subsampling"]
+    assert sub["mode"] == "reads_per_file" and sub["reads_per_file"] == 40
+    assert sub["pipeline_n_reads"] == 80
+
+
+def test_all_means_no_subsampling_and_says_reads_are_not_trimmed(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (100, 100)})
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "all"), env=s["env"])
+    p = json.loads((s["out"] / "reproducibility" / "params.json").read_text())
+    assert p["skip_subsampling"] is True and "n_reads" not in p
+    sub = result_json(s["out"])["subsampling"]
+    assert sub["mode"] == "all" and sub["trim_to_bp"] is None
+    assert "not trimmed" in (s["out"] / "report.md").read_text().lower()
+
+
+def test_skip_subsampling_alone_counts_as_choosing_all(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (50, 50)})
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--skip-subsampling"), env=s["env"])
+    assert result_json(s["out"])["subsampling"]["mode"] == "all"
+
+
+def test_a_number_together_with_skip_subsampling_is_a_conflict(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (50, 50)})
+    res = run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10",
+                            "--skip-subsampling"), env=s["env"], expect=None)
+    assert res.returncode in (1, 2) and "error:" in res.stderr
+    assert "unrecognized" not in res.stderr, "must be the wrapper's own conflict message"
+    assert "--skip-subsampling" in res.stderr and "--reads-per-file" in res.stderr
+
+
+def test_the_old_n_reads_flag_is_refused_with_the_reason(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (50, 50)})
+    res = run_cli(base_args(s, "--accept-bioskryb-terms", "--n-reads", "100"),
+                  env=s["env"], expect=None)
+    assert res.returncode in (1, 2) and "--reads-per-file" in res.stderr
+    assert "R1" in res.stderr  # explains that n_reads counts both files together
+
+
+def test_only_seed_123_is_allowed_because_read_2_is_hardcoded(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (50, 50)})
+    bad = run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10", "--seed", "7"),
+                  env=s["env"], expect=None)
+    assert bad.returncode in (1, 2) and "123" in bad.stderr and "read 2" in bad.stderr.lower()
+    assert not (s["out"] / "result.json").exists()
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10", "--seed", "123"),
+            env=s["env"])
+
+
+def test_sampling_state_and_expected_reads_are_recorded_per_sample(tmp_path):
+    s = counted_setup(tmp_path, {"big": (100, 100), "small": (30, 30)})
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "50"), env=s["env"])
+    sub = result_json(s["out"])["subsampling"]
+    assert sub["samples"]["big"] == {"r1": 100, "r2": 100, "pairs": 100,
+                                     "sampling_active": True, "expected_reads_per_file": 50}
+    assert sub["samples"]["small"]["sampling_active"] is False
+    assert sub["samples"]["small"]["expected_reads_per_file"] == 30
+    assert any("small" in w and "not trimmed" in w.lower() for w in sub["warnings"])
+
+
+def test_a_sample_the_pipeline_would_drop_is_warned_about(tmp_path):
+    # min_reads (5000) is compared with R1+R2 together: 2 x 2000 = 4000 < 5000
+    s = counted_setup(tmp_path, {"tiny": (2000, 2000), "fine": (4000, 4000)})
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "all", "--min-reads", "5000"),
+            env=s["env"])
+    warnings = " ".join(result_json(s["out"])["subsampling"]["warnings"])
+    assert "tiny" in warnings and "min_reads" in warnings
+    assert "fine" not in warnings.replace("fine-", "")
+
+
+def test_mates_with_different_read_counts_are_refused(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (100, 90)})
+    res = run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10"),
+                  env=s["env"], expect=None)
+    assert res.returncode == 1 and "s1" in res.stderr and "100" in res.stderr and "90" in res.stderr
+
+
+def test_the_trim_length_comes_from_the_pinned_pipeline_config(tmp_path):
+    s = counted_setup(tmp_path, {"s1": (100, 100)})
+    (s["pipeline"] / "nextflow.config").write_text("manifest { version = '2.0.0' }\nparams {\n  read_length = 50\n}\n")
+    subprocess.run([*GIT, "-C", str(s["pipeline"]), "commit", "-q", "-am", "cfg"], check=True)
+    subprocess.run([*GIT, "-C", str(s["pipeline"]), "tag", "-f", PIPELINE_TAG], check=True)
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10"), env=s["env"])
+    assert result_json(s["out"])["subsampling"]["trim_to_bp"] == 50
+    s["out"] = tmp_path / "out2"
+    run_cli(base_args(s, "--accept-bioskryb-terms", "--reads-per-file", "10", "--read-length", "40"),
+            env=s["env"])
+    assert result_json(s["out"])["subsampling"]["trim_to_bp"] == 40

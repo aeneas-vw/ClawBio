@@ -14,7 +14,9 @@ checkout of the pinned tag, and must accept BioSkryb's terms to run it.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
+import gzip
 import hashlib
 import json
 import os
@@ -23,6 +25,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +45,10 @@ DEMO_CSV = SKILL_DIR / "examples" / "demo_samplesheet.csv"
 PROG = "bj-expression-wrapper"
 PIPELINE_REPO = "https://github.com/BioSkryb/bj-expression.git"
 DEFAULT_PIPELINE_VERSION = "2.0.0"
+# bj-expression hard-codes `seqtk sample -s123` for read 2 (read 1 uses seqtk_sample_seed), so any
+# other seed would put the two mates of each pair out of sync.
+REQUIRED_SEED = 123
+DEMO_READS_PER_FILE = 10
 # Nextflow 26.x cannot parse bj-expression 2.0.0's config: it includes two
 # profile files (batch_dev_gpu.config, batch_prod_gpu.config) that are not in
 # the public repo. 25.04.6 and 24.10.5 both parse it (config parse only).
@@ -283,10 +290,111 @@ def preflight_tools(profile: str, nxf_version: str = DEFAULT_NEXTFLOW_VERSION) -
 
 
 # ──────────────────────────────────────────────
+# Reads available, and the explicit per-file choice
+# ──────────────────────────────────────────────
+# BioSkryb's SEQTK_SAMPLE divides n_reads by the reads of R1 AND R2 together, so its default
+# n_reads = 100000 meant ~50,000 reads per file. It trims to read_length only when it samples
+# (otherwise it copies the files unchanged), and it samples by fraction, so counts are approximate.
+
+def count_fastq_reads(path: Path) -> int:
+    """Number of records in a (gzipped) FASTQ; clear errors for unreadable or truncated files."""
+    path = Path(path)
+    lines, last = 0, b"\n"
+    opener = gzip.open if str(path).endswith(".gz") else open
+    try:
+        with opener(path, "rb") as fh:
+            while chunk := fh.read(1 << 22):
+                lines += chunk.count(b"\n")
+                last = chunk[-1:]
+    except (OSError, EOFError, zlib.error) as exc:
+        raise WrapperError(f"cannot read FASTQ {path.name}: {exc}") from exc
+    if last != b"\n":
+        lines += 1  # final record without a trailing newline
+    if lines % 4:
+        raise WrapperError(f"{path.name} is not a valid FASTQ: {lines} lines is not a multiple of 4")
+    return lines // 4
+
+
+def count_sample_reads(rows: list[dict]) -> dict[str, dict]:
+    """{sample: {"r1": n, "r2": n}} (None for remote files, which are not counted)."""
+    jobs = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, 2 * len(rows)))) as pool:
+        for r in rows:
+            for col in ("read1", "read2"):
+                jobs[(r["biosampleName"], col)] = (
+                    None if r["_remote"] else pool.submit(count_fastq_reads, Path(r[col])))
+        out: dict[str, dict] = {}
+        for (name, col), fut in jobs.items():
+            out.setdefault(name, {})["r1" if col == "read1" else "r2"] = fut.result() if fut else None
+    for name, c in out.items():
+        if c["r1"] is not None and c["r2"] is not None and c["r1"] != c["r2"]:
+            raise WrapperError(f"{name}: R1 has {c['r1']} reads but R2 has {c['r2']}; "
+                               "the two files of a pair must match")
+    return out
+
+
+def format_read_table(counts: dict[str, dict]) -> str:
+    w = max([len(n) for n in counts] + [6])
+    lines = [f"  {'sample':<{w}}  {'R1':>12}  {'R2':>12}  {'pairs':>12}"]
+    for name, c in counts.items():
+        f = lambda v: "unknown" if v is None else f"{v:,}"  # noqa: E731
+        lines.append(f"  {name:<{w}}  {f(c['r1']):>12}  {f(c['r2']):>12}  {f(c['r1']):>12}")
+    return "\n".join(lines)
+
+
+def resolve_read_choice(args) -> tuple[str, int | None] | None:
+    rpf = args.reads_per_file
+    if rpf is not None and rpf != "all" and args.skip_subsampling:
+        raise WrapperError("--reads-per-file N and --skip-subsampling contradict each other; "
+                           "use one number, or --reads-per-file all")
+    if rpf == "all" or (rpf is None and args.skip_subsampling):
+        return ("all", None)
+    return None if rpf is None else ("reads_per_file", rpf)
+
+
+def pipeline_default(pipeline_dir: Path | None, key: str) -> int | None:
+    """A default read from the pinned checkout's nextflow.config (not from the README)."""
+    if pipeline_dir is None:
+        return None
+    try:
+        text = (Path(pipeline_dir) / "nextflow.config").read_text()
+    except OSError:
+        return None
+    m = re.search(rf"^\s*{key}\s*=\s*(\d+)", text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def build_subsampling(choice, counts, read_length, min_reads) -> dict:
+    mode, n = choice
+    warnings: list[str] = []
+    samples = {}
+    for name, c in counts.items():
+        pairs = c["r1"]
+        active = None if pairs is None else (mode == "reads_per_file" and n < pairs)
+        samples[name] = {"r1": c["r1"], "r2": c["r2"], "pairs": pairs, "sampling_active": active,
+                         "expected_reads_per_file": (None if pairs is None else
+                                                     (min(n, pairs) if mode == "reads_per_file" else pairs))}
+        if mode == "reads_per_file" and pairs is not None and not active:
+            warnings.append(f"{name}: {n:,} is not below its {pairs:,} reads per file, so the pipeline "
+                            f"copies the files unchanged and they are not trimmed to "
+                            f"{read_length if read_length else 'read_length'} bp (it trims only when it samples)")
+        if pairs is not None and min_reads is not None and 2 * pairs < min_reads:
+            warnings.append(f"{name}: R1+R2 = {2 * pairs:,} reads is below min_reads ({min_reads:,}); "
+                            "the pipeline drops this sample")
+    if mode == "all":
+        warnings.insert(0, "no subsampling: the SEQTK step is skipped, so reads are not trimmed to "
+                           f"{read_length if read_length else 'read_length'} bp either")
+    return {"mode": mode, "reads_per_file": n, "pipeline_n_reads": None if n is None else 2 * n,
+            "seed": REQUIRED_SEED, "trim_to_bp": (read_length if mode == "reads_per_file" else None),
+            "min_reads": min_reads, "samples": samples, "warnings": warnings}
+
+
+# ──────────────────────────────────────────────
 # Params and command
 # ──────────────────────────────────────────────
 
-def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path) -> dict:
+def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path,
+                 choice: tuple[str, int | None] | None = None) -> dict:
     """Required values plus only the overrides the user asked for.
 
     Anything not listed keeps the pipeline's own default; passing our own
@@ -298,14 +406,18 @@ def build_params(args: argparse.Namespace, csv_path: Path, out_dir: Path) -> dic
         "timestamp": RUN_TIMESTAMP,
         "genome": args.genome,
     }
-    for attr, key in (("n_reads", "n_reads"), ("read_length", "read_length"),
+    for attr, key in (("read_length", "read_length"),
                       ("min_reads", "min_reads"), ("seed", "seqtk_sample_seed"),
                       ("instrument", "instrument"), ("max_cpus", "max_cpus"),
                       ("max_memory", "max_memory"), ("genomes_base", "genomes_base")):
         value = getattr(args, attr)
         if value is not None:
             params[key] = value
-    for flag in ("skip_subsampling", "skip_cutadapt", "skip_qc_plots"):
+    if choice and choice[0] == "reads_per_file":
+        params["n_reads"] = 2 * choice[1]  # the pipeline divides n_reads by R1+R2 together
+    elif choice and choice[0] == "all":
+        params["skip_subsampling"] = True
+    for flag in ("skip_cutadapt", "skip_qc_plots"):
         if getattr(args, flag):
             params[flag] = True
     return params
@@ -535,6 +647,27 @@ def write_report(out_dir: Path, result: dict) -> Path:
     if result.get("missing_outputs"):
         lines += ["**Expected but not produced:** "
                   + ", ".join(f"`{m}`" for m in result["missing_outputs"]), ""]
+    sub = result.get("subsampling")
+    if sub:
+        lines += ["## Subsampling", ""]
+        if sub["mode"] == "all":
+            lines += ["**All reads used** (no subsampling). The SEQTK step is skipped, so the reads are "
+                      "**not trimmed** to `read_length` either.", ""]
+        else:
+            trim = sub["trim_to_bp"] or "read_length"
+            lines += [f"**{sub['reads_per_file']:,} reads from each file.** The pipeline's `n_reads` was set "
+                      f"to {sub['pipeline_n_reads']:,} because it counts R1 and R2 together. It samples by "
+                      f"fraction with seed {sub['seed']}, so the numbers are approximate. Reads are trimmed to "
+                      f"{trim} bp only where sampling happens.", ""]
+        lines += ["| Sample | Reads per file available | Sampled? | Expected per file |", "|---|--:|---|--:|"]
+        for name, c in sub["samples"].items():
+            av = "unknown (remote)" if c["pairs"] is None else f"{c['pairs']:,}"
+            sam = "n/a" if c["sampling_active"] is None else ("yes" if c["sampling_active"] else "no, copied unchanged")
+            ex = "unknown" if c["expected_reads_per_file"] is None else f"{c['expected_reads_per_file']:,}"
+            lines.append(f"| {name} | {av} | {sam} | {ex} |")
+        lines.append("")
+        for w in sub["warnings"]:
+            lines += [f"> **Warning:** {w}", ""]
     mat = result.get("results_materialised")
     if mat:
         lines += [f"**Results are real files:** {mat['files']} files ({mat['bytes'] / 1e6:.1f} MB) "
@@ -622,6 +755,29 @@ def _nxf_version(value: str) -> str:
         "installed Nextflow unchanged)")
 
 
+def _reads_per_file(value: str):
+    if value == "all":
+        return "all"
+    return _int(1, "--reads-per-file")(value)
+
+
+def _old_n_reads(value: str):
+    raise argparse.ArgumentTypeError(
+        "--n-reads was replaced by --reads-per-file. The pipeline's n_reads counts R1 and R2 "
+        "together, so the old default of 100000 gave about 50,000 reads per file. Give the "
+        "reads you want from each file: --reads-per-file N (or 'all').")
+
+
+def _seed(value: str) -> int:
+    n = _int(0, "--seed")(value)
+    if n != REQUIRED_SEED:
+        raise argparse.ArgumentTypeError(
+            f"--seed must be {REQUIRED_SEED}: the pipeline hard-codes -s{REQUIRED_SEED} for read 2 and "
+            "applies the seed parameter only to read 1, so any other seed would put the two mates "
+            "of each pair out of sync.")
+    return n
+
+
 def _memory(value: str) -> str:
     if not re.fullmatch(r"\d+(?:\.\d+)?[. ]?(?:KB|MB|GB|TB)", value):
         raise argparse.ArgumentTypeError("--max-memory looks like 50.GB or 512.MB")
@@ -651,14 +807,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--genome", choices=GENOMES, default="GRCh38")
     p.add_argument("--profile", choices=PROFILES, default="docker",
                    help="Container backend (default docker)")
-    p.add_argument("--n-reads", type=_int(1, "--n-reads"),
-                   help="Reads to sample per sample (pipeline default if omitted)")
+    p.add_argument("--reads-per-file", type=_reads_per_file, default=None, metavar="N|all",
+                   help="REQUIRED for a run or --check: reads to keep from EACH file of a pair (a "
+                        "number), or 'all' for no subsampling. The wrapper shows the reads "
+                        "available first (--count-reads shows them without running).")
+    p.add_argument("--count-reads", action="store_true",
+                   help="Count the reads in every FASTQ of --input, print the table, and stop")
+    p.add_argument("--n-reads", type=_old_n_reads, default=None, help=argparse.SUPPRESS)
     p.add_argument("--read-length", type=_int(1, "--read-length"),
                    help="Read length to trim to (pipeline default if omitted)")
     p.add_argument("--min-reads", type=_int(0, "--min-reads"),
                    help="Minimum reads for a sample to be analysed (pipeline default if omitted)")
-    p.add_argument("--seed", type=_int(0, "--seed"),
-                   help="seqtk sample seed inside the pipeline (pipeline default if omitted)")
+    p.add_argument("--seed", type=_seed, default=None,
+                   help="seqtk seed; only 123 is allowed (the pipeline hard-codes it for read 2)")
     p.add_argument("--skip-subsampling", action="store_true")
     p.add_argument("--skip-cutadapt", action="store_true")
     p.add_argument("--skip-qc-plots", action="store_true")
@@ -687,6 +848,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.count_reads:
+        if args.input is None:
+            raise WrapperError("--input is required with --count-reads")
+        counts = count_sample_reads(validate_input_csv(args.input, require_groups=False))
+        print("Reads available per sample (R1 / R2 / pairs):\n" + format_read_table(counts))
+        return 0
     if args.output is None:
         raise WrapperError("--output is required")
     if args.materialise_only:
@@ -728,11 +895,35 @@ def run(args: argparse.Namespace) -> int:
                               base_dir=base)
     samples = [r["biosampleName"] for r in rows]
 
+    choice = resolve_read_choice(args)
+    counts = count_sample_reads(rows)
+    if mode == "demo" and choice is None:
+        choice = ("reads_per_file", DEMO_READS_PER_FILE)
+    if choice is None:
+        raise WrapperError(
+            "choose how many reads to use from each file before the run starts.\n"
+            "Reads available per sample (R1 / R2 / pairs):\n" + format_read_table(counts) + "\n"
+            "Give --reads-per-file N (reads from EACH file of a pair; the pipeline samples by "
+            "fraction, so the result is approximate) or --reads-per-file all to use every read. "
+            "The pipeline's own default (100000 reads counted across R1 and R2 together, about "
+            "50,000 per file) is no longer applied silently.")
+
     pipeline, tools = None, {}
     if mode != "demo":
         pipeline = check_pipeline_source(args.pipeline_dir, args.pipeline_version,
                                          args.allow_dirty_pipeline)
         tools = preflight_tools(args.profile, args.nextflow_version)
+
+    pdir = pipeline["path"] if pipeline else None
+    sub = build_subsampling(
+        choice, counts,
+        args.read_length if args.read_length is not None else pipeline_default(pdir, "read_length"),
+        args.min_reads if args.min_reads is not None else pipeline_default(pdir, "min_reads"))
+    print(f"{PROG}: reads available per sample (R1 / R2 / pairs):\n{format_read_table(counts)}")
+    print(f"{PROG}: using " + ("ALL reads (no subsampling)" if sub["mode"] == "all" else
+          f"{sub['reads_per_file']:,} reads from each file (pipeline n_reads = {sub['pipeline_n_reads']:,})"))
+    for w in sub["warnings"]:
+        print(f"{PROG}: WARNING: {w}")
 
     if args.extra_config is not None and not args.extra_config.is_file():
         raise WrapperError(f"--extra-config file not found: {args.extra_config}")
@@ -745,7 +936,7 @@ def run(args: argparse.Namespace) -> int:
         kept_config = repro / "extra.config"
         shutil.copyfile(args.extra_config, kept_config)
     csv_path = write_normalised_csv(rows, repro / "samplesheet.normalised.csv")
-    params = build_params(args, csv_path, out_dir)
+    params = build_params(args, csv_path, out_dir, choice)
     (repro / "params.json").write_text(json.dumps(params, indent=2) + "\n")
 
     run_dir = out_dir / "nextflow_run"
@@ -767,6 +958,7 @@ def run(args: argparse.Namespace) -> int:
         "tools": tools,
         "profile": args.profile,
         "results_materialised": None,
+        "subsampling": sub,
         "nextflow_version_requested": args.nextflow_version,
         "extra_config": str(kept_config) if kept_config else None,
         "params": params,

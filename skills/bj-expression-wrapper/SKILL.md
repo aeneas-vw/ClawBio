@@ -169,28 +169,45 @@ python skills/bj-expression-wrapper/bj_expression_wrapper.py \
 
 `--genomes-base` redirects all seven reference parameters (checked by resolving the pipeline's own config with the wrapper's params file).
 
+## Choosing how many reads to use
+
+Before anything starts, the wrapper counts the reads in every FASTQ and prints them (R1 / R2 / pairs). You then choose `--reads-per-file N` (reads kept from EACH file of a pair) or `all`. There is no silent default. What the pipeline's SEQTK step really does, read from its code and confirmed on run1:
+
+| Fact | Consequence |
+|---|---|
+| Its `n_reads` is divided by the reads of **R1 and R2 together** | The old default `n_reads = 100000` kept only about 50,000 reads **per file**. On run1 that was 11-24% of each sample's reads. The wrapper sets `n_reads = 2 x N` for you. |
+| It samples by **fraction** (`seqtk sample`) | The count per file is approximate (run1: 49,690-49,981 for a target of 50,000). |
+| It trims reads to `read_length` (default 50) **only when it samples** | If N is not below a sample's reads, the files are copied unchanged and are **not trimmed**. `all` skips the step, so nothing is trimmed. Mixing samples that are sampled and samples that are not mixes 50 bp and full-length reads. The wrapper warns. |
+| Read 2 is always sampled with a **hard-coded `-s123`** | Any other `--seed` would put the mates out of sync, so the wrapper allows only 123. |
+| Samples with R1+R2 below `min_reads` (5000) are dropped | The wrapper warns before the run. |
+
+`result.json` records the choice, the pipeline value, every sample's reads available, whether it is sampled, and the expected reads per file; `report.md` has the same as a table.
+
 ## CLI Reference
 
 ```bash
-# Check everything without running (no terms flag needed)
-python skills/bj-expression-wrapper/bj_expression_wrapper.py \
-  --input samples.csv --pipeline-dir ~/bj-expression --output ~/runs/rna1 --check
+# 1. See how many reads each FASTQ has (runs nothing, needs no pipeline or tools)
+python skills/bj-expression-wrapper/bj_expression_wrapper.py --input samples.csv --count-reads
 
-# Run
+# 2. Check everything without running (no terms flag needed). --reads-per-file is required here too.
+python skills/bj-expression-wrapper/bj_expression_wrapper.py \
+  --input samples.csv --pipeline-dir ~/bj-expression --output ~/runs/rna1 --reads-per-file 200000 --check
+
+# 3. Run: you choose how many reads to take from EACH file, or 'all'
 python skills/bj-expression-wrapper/bj_expression_wrapper.py \
   --input samples.csv --pipeline-dir ~/bj-expression --output ~/runs/rna1 \
-  --accept-bioskryb-terms --max-cpus 8 --max-memory 50.GB
+  --reads-per-file 200000 --accept-bioskryb-terms --max-cpus 8 --max-memory 50.GB
 
 # Singularity instead of Docker; mouse genome; continue an earlier run
 python skills/bj-expression-wrapper/bj_expression_wrapper.py \
-  --input samples.csv --pipeline-dir ~/bj-expression --output ~/runs/rna1 \
+  --input samples.csv --pipeline-dir ~/bj-expression --output ~/runs/rna1 --reads-per-file all \
   --accept-bioskryb-terms --profile singularity --genome GRCm39 --resume
 
 # Demo: plans a run on synthetic data, runs nothing
 python skills/bj-expression-wrapper/bj_expression_wrapper.py --demo --output ~/scratch/bj_demo
 ```
 
-Optional overrides (each omitted flag keeps the pipeline default): `--n-reads`, `--read-length`, `--min-reads`, `--seed` (the pipeline's seqtk seed), `--skip-subsampling`, `--skip-cutadapt`, `--skip-qc-plots`, `--instrument`, `--genomes-base`.
+**Required for a run or `--check`:** `--reads-per-file N|all` (see the next section). Optional overrides (each omitted flag keeps the pipeline default): `--read-length`, `--min-reads`, `--skip-subsampling` (same as `--reads-per-file all`), `--skip-cutadapt`, `--skip-qc-plots`, `--instrument`, `--genomes-base`.
 
 Wrapper options: `--keep-symlinks` (leave Nextflow's symlinks in `results_clawbio/`; by default they are replaced with verified real copies after a successful run), `--materialise-only` (do that for an existing run: `--output <run folder>`, run directly, not through `clawbio.py`, which requires an input), `--strict` (exit 1 when any task failed and was ignored, instead of exit 0 with a warning), `--nextflow-version` (default `25.04.6`, set as `NXF_VER` on every Nextflow call; `system` leaves your install alone) and `--extra-config FILE` (passed to Nextflow with `-c` and copied into the bundle).
 
@@ -280,7 +297,8 @@ Docker needs a Carolina Cloud VM; containers cannot run it. The README suggests 
 - **The model will want to clone or vendor the pipeline for the user. Do not.** It is under BioSkryb's terms, not an open-source licence. The user fetches it and passes `--pipeline-dir`; the wrapper never downloads it.
 - **The model will want to say every input sample was analysed. Do not.** Samples below `min_reads` are dropped before quantification and simply absent from the counts. Read `samples_missing_from_outputs` in `result.json`.
 - **The model will want to treat Nextflow exit 0 as success. Do not.** The wrapper also requires the key outputs; otherwise the status is `incomplete`.
-- **The model will want to pre-downsample the FASTQs "to save time". Do not by default.** The pipeline already downsamples (own seed, default 123) and a second pass changes the sample.
+- **The model will want to pre-downsample the FASTQs "to save time". Do not by default.** The pipeline already downsamples (seed 123) and a second pass changes the sample.
+- **The model will want to say the pipeline uses 100,000 reads per file by default. It does not.** Its `n_reads` counts R1 and R2 together, so that default was ~50,000 per file, and the wrapper no longer applies any default: the user chooses `--reads-per-file`. Never pick a number for the user.
 - **The model will want to run this inside a ClawBio container. Do not.** Docker-in-Docker is unsupported there and the memory is usually too small for STAR. Use a VM.
 - **The `groups` requirement comes from BioSkryb's README and was not verified in the QC-plots code.** If a run fails on it, report that to the user.
 

@@ -771,11 +771,12 @@ SKILLS = {
             "--seed", "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots",
             "--instrument", "--max-cpus", "--max-memory", "--genomes-base",
             "--resume", "--strict", "--keep-symlinks", "--materialise-only",
+            "--reads-per-file", "--count-reads",
         },
         "allowed_extra_flags_without_values": {
             "--check", "--accept-bioskryb-terms", "--allow-dirty-pipeline",
             "--skip-subsampling", "--skip-cutadapt", "--skip-qc-plots", "--resume",
-            "--strict", "--keep-symlinks", "--materialise-only",
+            "--strict", "--keep-symlinks", "--materialise-only", "--count-reads",
         },
         "accepts_genotypes": False,
     },
